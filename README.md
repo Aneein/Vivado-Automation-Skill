@@ -254,7 +254,24 @@ The only Vitis automation kept by default is the Vivado/Vitis 2021.1 BSP Makefil
 
 ## Command: Migrate Vivado Project
 
-Generate migration files only:
+Run the migration from the Python command so the tool selects the configured Vivado versions and can validate paths/host execution:
+
+```powershell
+python .\scripts\vivado_assistant.py migrate-project `
+  --project C:\old_project\old_project.xpr `
+  --out C:\migration_work `
+  --new-project-dir C:\new_2021_1_project `
+  --source-version 2020.2 `
+  --target-version 2021.1 `
+  --run-export `
+  --run-rebuild
+```
+
+The source and target versions are chosen by the user. If `--source-version` or `--target-version` is provided, that exact version must be configured by `init`; the tool will not fall back to the default Vivado. If the user wants a custom executable for this one migration, add `--source-vivado` and `--target-vivado`; these paths are normalized and validated like `init` paths.
+
+`migrate-project --run-export --run-rebuild` rebuilds the clean target Vivado project only. It does not run synthesis, implementation, bitstream, or XSA export. After migration succeeds, run a fresh full build flow or open the migrated `.xpr` and build manually.
+
+For advanced/debug use only, generate migration files without running them:
 
 ```powershell
 python .\scripts\vivado_assistant.py migrate-project `
@@ -265,16 +282,7 @@ python .\scripts\vivado_assistant.py migrate-project `
   --target-version 2021.1
 ```
 
-The source and target versions are chosen by the user. If `init` has not been run, or if the user wants a custom executable for this one migration, add `--source-vivado` and `--target-vivado` manually.
-
-Then run the emitted Tcl scripts:
-
-```powershell
-"C:\Xilinx\Vivado\2020.2\bin\vivado.bat" -mode batch -source C:\migration_work\01_export_bd_from_source_vivado.tcl
-"C:\Xilinx\Vivado\2021.1\bin\vivado.bat" -mode batch -source C:\migration_work\02_rebuild_project_in_target_vivado.tcl
-```
-
-Or run from the Python command:
+Manual Vivado `-mode batch -source` execution of the emitted Tcl is a debug fallback, not the normal agent path.
 
 ```powershell
 python .\scripts\vivado_assistant.py migrate-project `
@@ -291,7 +299,7 @@ python .\scripts\vivado_assistant.py migrate-project `
 
 Run this only after the user has opened Vitis, selected the workspace, and created the application/platform. The generated BSP Makefile must already exist. Patch before clicking `Build Application`.
 
-Check matched Makefiles:
+Check matched BSP root Makefiles first. If the workspace contains multiple platforms/apps, inspect this list before patching:
 
 ```powershell
 python .\scripts\vivado_assistant.py patch-vitis-makefile `
@@ -299,12 +307,11 @@ python .\scripts\vivado_assistant.py patch-vitis-makefile `
   --dry-run
 ```
 
-Patch them:
+Patch all matched BSP root Makefiles:
 
 ```powershell
 python .\scripts\vivado_assistant.py patch-vitis-makefile `
   --workspace <App_workspace> `
-  --sequential-drivers driver1,driver2 `
   --jobs 30
 ```
 
@@ -315,6 +322,23 @@ python .\scripts\vivado_assistant.py patch-vitis-makefile `
   --workspace <App_workspace> `
   --makefile <App_workspace>\platform_name\zynq_fsbl\zynq_fsbl_bsp\Makefile
 ```
+
+`--sequential-drivers` is optional. Use it only when some BSP drivers must be built before the parallel driver build step. Values are driver folder names under `ps7_cortexa9_0\libsrc\`, not full paths, for example:
+
+```powershell
+python .\scripts\vivado_assistant.py patch-vitis-makefile `
+  --workspace <App_workspace> `
+  --sequential-drivers xilffs_v4_4,xilpm_v2_9 `
+  --jobs 30
+```
+
+Each name must correspond to:
+
+```text
+<workspace>\<platform>\<bsp>\ps7_cortexa9_0\libsrc\<driver_name>\src\Makefile
+```
+
+If you do not know which drivers need sequential builds, omit `--sequential-drivers`.
 
 The script creates `Makefile.bak` the first time it patches a file.
 
@@ -331,4 +355,4 @@ The intended flow is:
 5. Source the exported BD Tcl.
 6. Generate wrappers and output products.
 7. Upgrade IP if needed.
-8. Build synthesis/implementation/bitstream from the clean target project.
+8. Build synthesis/implementation/bitstream from the clean target project as a separate step.

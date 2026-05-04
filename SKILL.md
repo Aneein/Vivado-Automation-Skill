@@ -145,6 +145,7 @@ After initialization:
 - Normal project/build commands use the configured default Vivado. If only one Vivado is configured, they use that one.
 - `migrate-project` should use the source and target versions chosen by the user, for example `--source-version 2020.2 --target-version 2021.1`.
 - A specific command may still override the executable with `--vivado`, `--source-vivado`, or `--target-vivado`.
+- For migration, explicit `--source-version` and `--target-version` are strict. If a requested version is not configured, stop and ask the user to run `init` or pass `--source-vivado`/`--target-vivado`; never fall back to the default Vivado for an explicitly requested migration version.
 
 ## Project Structure & Path Rules
 
@@ -378,10 +379,12 @@ python scripts/vivado_assistant.py migrate-project \
   --out <migration_work_dir> \
   --new-project-dir <new_clean_project_dir> \
   --source-version <configured_source_version> \
-  --target-version <configured_target_version>
+  --target-version <configured_target_version> \
+  --run-export \
+  --run-rebuild
 ```
 
-The user can also pass exact executables instead of configured versions with `--source-vivado` and `--target-vivado`.
+The user can also pass exact executables instead of configured versions with `--source-vivado` and `--target-vivado`; normalize and validate these paths exactly like `init`.
 
 The command writes:
 
@@ -392,9 +395,10 @@ The command writes:
 
 Safe migration flow:
 
-1. Run `01_export_bd_from_source_vivado.tcl` with the source Vivado version.
-2. Run `02_rebuild_project_in_target_vivado.tcl` with the target Vivado version.
+1. Prefer `migrate-project --run-export --run-rebuild` so the Python CLI drives both Vivado versions and can validate host/path errors.
+2. Use the emitted Tcl files manually only for advanced/debug fallback.
 3. Rebuild from HDL/XDC/XCI and exported BD Tcl.
+4. Preserve and reapply the source project's `BoardPart` into the clean target project when present.
 4. Do not copy `.xpr`, `.runs`, `.cache`, `.gen`, `.ip_user_files`, `.sim`, or `.hw`.
 
 If the user explicitly wants execution and Vivado is available, pass `--run-export` and/or `--run-rebuild`.
@@ -420,11 +424,15 @@ Command:
 ```bash
 python scripts/vivado_assistant.py patch-vitis-makefile \
   --workspace <vitis_app_workspace> \
-  --sequential-drivers driver1,driver2 \
+  --sequential-drivers xilffs_v4_4,xilpm_v2_9 \
   --jobs 30
 ```
 
-The command searches inside the completed Vitis workspace for generated BSP root `Makefile` files, creates `Makefile.bak` if missing, and writes the known-good 2021.1-compatible Makefile.
+The command searches inside the completed Vitis workspace for generated BSP root `Makefile` files, creates `Makefile.bak` if missing, and writes the known-good 2021.1-compatible Makefile. Always run `--dry-run` first when patching a whole workspace, because multiple platforms/apps can contain multiple BSP root Makefiles.
+
+`--sequential-drivers` is optional. Values are driver folder names under `ps7_cortexa9_0/libsrc/`, not full paths. Each value must correspond to `ps7_cortexa9_0/libsrc/<driver_name>/src/Makefile`. If the needed driver names are unknown, omit `--sequential-drivers`.
+
+If the user passes `--makefile`, patch only BSP root Makefiles such as `<platform>/zynq_fsbl/zynq_fsbl_bsp/Makefile`. Refuse to patch driver-level files such as `ps7_cortexa9_0/libsrc/<driver>/src/Makefile`.
 
 For checking first:
 
@@ -469,8 +477,9 @@ Before running scripts:
 After running migration:
 
 1. Check `ip_status_before_upgrade.rpt` and `ip_status_after_upgrade.rpt` if generated.
-2. Run synthesis only after BD validation and wrapper generation succeed.
-3. If Vitis 2021.1 BSP build is involved, patch the Makefile before build.
+2. Remember that migration only rebuilds the clean Vivado project; it does not run synthesis, implementation, bitstream, or XSA export.
+3. Run synthesis only after BD validation and wrapper generation succeed.
+4. If Vitis 2021.1 BSP build is involved, patch the Makefile before build.
 
 ## Failure Handling
 

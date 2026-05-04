@@ -48,6 +48,7 @@ class ProjectManifest:
     source_project: str
     project_name: str
     part: str
+    board_part: str
     target_language: str
     simulator_language: str
     top: str
@@ -126,7 +127,7 @@ def load_config(path: str | None = None) -> dict[str, str]:
     config_path = Path(path).resolve() if path else default_config_path()
     if not config_path.exists():
         return {}
-    return json.loads(config_path.read_text(encoding="utf-8"))
+    return json.loads(config_path.read_text(encoding="utf-8-sig"))
 
 
 def save_config(config: dict[str, str], path: str | None = None) -> Path:
@@ -251,13 +252,29 @@ def resolve_versioned_vivado(
     config: dict[str, str],
     explicit_path: str,
     explicit_version: str,
+    role: str,
     fallback: str = "",
 ) -> str:
     if explicit_path:
-        return explicit_path
+        resolved, notes = resolve_vivado_launcher(explicit_path)
+        if notes:
+            raise SystemExit(f"Invalid {role} Vivado path:\n  - " + "\n  - ".join(notes))
+        return resolved
     if explicit_version:
-        return config.get(version_key(explicit_version), "") or fallback or "vivado"
-    return fallback or config.get("default_vivado", "") or sole_configured_vivado(config) or "vivado"
+        key = version_key(explicit_version)
+        value = config.get(key, "")
+        if not value:
+            raise SystemExit(
+                f"{role} version {explicit_version} was requested, but {key} is not configured. "
+                f"Run init first or pass --{role}-vivado explicitly."
+            )
+        resolved, notes = resolve_vivado_launcher(value)
+        if notes:
+            raise SystemExit(f"Invalid configured {role} Vivado path:\n  - " + "\n  - ".join(notes))
+        return resolved
+    if fallback:
+        return fallback
+    raise SystemExit(f"No {role} Vivado was specified.")
 
 
 def init_config_cmd(args: argparse.Namespace) -> int:
@@ -379,6 +396,7 @@ def parse_xpr_basic(xpr: Path) -> dict[str, str]:
     data = {
         "project_name": xpr.stem,
         "part": "xc7z020clg400-1",
+        "board_part": "",
         "target_language": "Verilog",
         "simulator_language": "Mixed",
         "top": "",
@@ -393,6 +411,11 @@ def parse_xpr_basic(xpr: Path) -> dict[str, str]:
         marker = f'Name="{key}" Val="'
         if marker in text:
             data["part"] = text.split(marker, 1)[1].split('"', 1)[0]
+            break
+    for key in ("BoardPart", "board_part"):
+        marker = f'Name="{key}" Val="'
+        if marker in text:
+            data["board_part"] = text.split(marker, 1)[1].split('"', 1)[0]
             break
     for key, out_key in (
         ("TargetLanguage", "target_language"),
@@ -432,6 +455,7 @@ def manifest_from_project(project: Path) -> ProjectManifest:
         source_project=norm(xpr),
         project_name=info["project_name"],
         part=info["part"],
+        board_part=info["board_part"],
         target_language=info["target_language"],
         simulator_language=info["simulator_language"],
         top=info["top"],
@@ -484,6 +508,11 @@ def write_rebuild_tcl(manifest: ProjectManifest, out_dir: Path, new_project_dir:
     xdc = tcl_list(manifest.xdc_files)
     xci = tcl_list(manifest.xci_files)
     top_line = f"set_property top {{{manifest.top}}} [current_fileset]" if manifest.top else "# Top is inferred after compile-order update."
+    board_part_line = (
+        f"set_property board_part {{{manifest.board_part}}} [current_project]"
+        if manifest.board_part
+        else "# Source project had no BoardPart property."
+    )
     script.write_text(
         f"""# Auto-generated. Run with the target Vivado version, for example 2021.1.
 set project_name {{{manifest.project_name}_migrated}}
@@ -493,6 +522,7 @@ set bd_export_dir {{{bd_dir}}}
 
 file mkdir $project_dir
 create_project $project_name $project_dir -part $part -force
+{board_part_line}
 set_property target_language {{{manifest.target_language}}} [current_project]
 set_property simulator_language {{{manifest.simulator_language}}} [current_project]
 set_property TARGET_SIMULATOR XSim [current_project]
@@ -1455,6 +1485,23 @@ def migrate_project(args: argparse.Namespace) -> int:
     project = Path(args.project).resolve()
     out_dir = Path(args.out).resolve()
     ensure_dir(out_dir)
+    config = load_config(args.assistant_config)
+    default_vivado = resolve_vivado(args)
+    source_vivado = resolve_versioned_vivado(
+        config,
+        args.source_vivado,
+        args.source_version,
+        role="source",
+        fallback=default_vivado,
+    )
+    target_vivado = resolve_versioned_vivado(
+        config,
+        args.target_vivado,
+        args.target_version,
+        role="target",
+        fallback=default_vivado,
+    )
+
     manifest = manifest_from_project(project)
     manifest_path = out_dir / "migration_manifest.json"
     manifest_path.write_text(json.dumps(asdict(manifest), indent=2), encoding="utf-8")
@@ -1466,28 +1513,15 @@ def migrate_project(args: argparse.Namespace) -> int:
     print(f"Wrote source export Tcl: {export_tcl}")
     print(f"Wrote target rebuild Tcl: {rebuild_tcl}")
 
-    config = load_config(args.assistant_config)
-    default_vivado = resolve_vivado(args)
-    source_vivado = resolve_versioned_vivado(
-        config,
-        args.source_vivado,
-        args.source_version,
-        fallback=default_vivado,
-    )
-    target_vivado = resolve_versioned_vivado(
-        config,
-        args.target_vivado,
-        args.target_version,
-        fallback=default_vivado,
-    )
-
     if args.run_export:
+        require_host_can_run(source_vivado)
         run_vivado(source_vivado, export_tcl, out_dir)
     if args.run_rebuild:
+        require_host_can_run(target_vivado)
         run_vivado(target_vivado, rebuild_tcl, out_dir)
 
     if not args.run_export or not args.run_rebuild:
-        print("Next:")
+        print("Next (advanced/debug fallback; prefer --run-export --run-rebuild for normal automation):")
         print(f"  {source_vivado} -mode batch -source {export_tcl}")
         print(f"  {target_vivado} -mode batch -source {rebuild_tcl}")
     return 0
@@ -1498,12 +1532,18 @@ def find_bsp_makefiles(root: Path) -> list[Path]:
     for path in root.rglob("Makefile"):
         if should_ignore(path):
             continue
-        parts = [p.lower() for p in path.parts]
-        if "libsrc" in parts and "src" in parts:
-            continue
-        if path.parent.name.endswith("_bsp") or "zynq_fsbl_bsp" in parts:
-            candidates.append(path)
+        if is_bsp_root_makefile(path):
+            candidates.append(path.resolve())
     return sorted(set(candidates))
+
+
+def is_bsp_root_makefile(path: Path) -> bool:
+    if path.name != "Makefile":
+        return False
+    parts = [part.lower() for part in path.parts]
+    if "libsrc" in parts and "src" in parts:
+        return False
+    return path.parent.name.endswith("_bsp") or "zynq_fsbl_bsp" in parts
 
 
 def patch_vitis_makefile(args: argparse.Namespace) -> int:
@@ -1511,6 +1551,9 @@ def patch_vitis_makefile(args: argparse.Namespace) -> int:
     makefiles = [Path(args.makefile).resolve()] if args.makefile else find_bsp_makefiles(root)
     if not makefiles:
         raise FileNotFoundError(f"No BSP Makefile found under {root}")
+    for makefile in makefiles:
+        if not is_bsp_root_makefile(makefile):
+            raise SystemExit(f"Refusing to patch non-BSP-root Makefile: {makefile}")
 
     drivers = [d.strip() for d in args.sequential_drivers.split(",") if d.strip()]
     sequential = " ".join(f"ps7_cortexa9_0/libsrc/{d}/src/Makefile" for d in drivers)
@@ -1744,7 +1787,7 @@ def build_parser() -> argparse.ArgumentParser:
     patch.add_argument(
         "--sequential-drivers",
         default="",
-        help="Comma-separated driver folder names to build sequentially (e.g. driver1,driver2)",
+        help="Comma-separated ps7_cortexa9_0/libsrc driver folder names to build sequentially (e.g. xilffs_v4_4,xilpm_v2_9)",
     )
     patch.add_argument("--dry-run", action="store_true", help="Only print matched Makefiles")
     patch.set_defaults(func=patch_vitis_makefile)
