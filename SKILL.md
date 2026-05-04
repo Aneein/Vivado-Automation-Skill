@@ -46,8 +46,17 @@ Then enforce the checklist after each design step, before moving on:
 3. **After BD wiring:** verify clocks, resets, AXI interfaces, external ports, interrupts, UART, and address segments required by the goal are connected/configured. Then run `validate_bd_design`.
 4. **After wrapper generation:** verify the wrapper is the project top.
 5. **After synthesis/implementation:** read run status, DRC, timing summary, and bit/XSA location.
+6. **After hardware export:** inspect the XSA archive itself. A Vitis-ready exported hardware platform must contain at least one `.bit` and one `.hwh`; do not trust `write_hw_platform` completion alone.
 
 For serial-print PS designs, explicitly choose the PS UART required by the board, for example `--ps-uart uart1` for the common PYNQ-Z2 USB-UART mapping. The tool must assert the UART is enabled and has MIO assigned. This is one example of the general rule: if the user's goal depends on a peripheral or interface, configure and assert that peripheral or interface explicitly.
+
+For Zynq board designs, especially PYNQ-Z2, do not rely on a bare part-only project when the board part is known. Pass `--board-part`, for example:
+
+```bash
+--part xc7z020clg400-1 --board-part tul.com.tw:pynq-z2:part0:1.0
+```
+
+The workflow must set and assert `board_part` immediately after `create_project`, before creating the BD. A missing board part leaves `BoardPart` empty in the `.xpr`; PS7 automation may then miss board-specific initialization/preset details, which can surface later in Vitis/JTAG as errors such as PS debug/APB memory access being disabled.
 
 ## Required Pipelines
 
@@ -79,6 +88,7 @@ Use one of these two normal Vivado pipelines. Each step must complete before the
 11. Run implementation to `write_bitstream`.
 12. Locate the `.bit` in Vivado's standard `impl_1` run directory.
 13. If hardware export is requested, run `write_hw_platform -include_bit`.
+14. Open the generated XSA and verify it contains `.bit` and `.hwh` before telling the user it is ready for Vitis.
 
 These are the only default full-flow sequences. Do not synthesize before wrapper generation in a BD flow. Do not add XDC as an orphan file outside `constrs_1`.
 
@@ -176,6 +186,8 @@ Generated automation files are outside this directory by default:
 - **`M_AXI_GP0_ACLK` must be explicitly connected** to `FCLK_CLK0` after `apply_bd_automation`, otherwise `validate_bd_design` fails.
 - **`proc_sys_reset/dcm_locked` must be driven.** Use `xlconstant` (CONST_VAL=1) to tie it high when FCLK comes directly from PS.
 - **Configure PS properties BEFORE `apply_bd_automation`**, connect `M_AXI_GP0_ACLK` AFTER.
+- **XSA export must be content-verified.** `run-rtl-workflow --export-hw --run` inspects the generated XSA as a zip archive and fails if `.bit` or `.hwh` is missing. If a user re-exports hardware manually and Vitis starts working, treat that as a missing/invalid hardware-export artifact until the XSA inspection proves otherwise.
+- **Zynq board projects need `board_part` when available.** If Vitis can create a platform but ELF download/run fails with PS debug/APB access errors, compare the `.xpr` against a known-good project and check whether `BoardPart` is empty. Rebuild with `--board-part <vendor>:<board>:part0:<version>` instead of only `--part`.
 
 ## Supported Commands
 
@@ -343,6 +355,8 @@ Default PS-side flow:
 Do not run Vitis `app build`, Eclipse headless build, or Run As automation by default. Only do so if the user explicitly asks to experiment with Vitis automation and accepts that it may depend on local GUI/JTAG state.
 
 Exception: the `patch-vitis-makefile` command remains supported and should be used for the Vivado/Vitis 2021.1 BSP Makefile bug before the user builds the app.
+
+If Vitis reports `CDT Project already configured`, `Failed to create application project`, or shows an existing project from `getProjects`, first suspect Vitis workspace metadata/name collision. Use a new empty Vitis workspace or remove/rename the existing application/platform project in Vitis. Do not immediately blame the XSA unless the XSA content inspection shows missing `.bit` or `.hwh`.
 
 ### 1. Migrate a Vivado Project Across Versions
 

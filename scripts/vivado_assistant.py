@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
@@ -829,6 +830,12 @@ add_files -fileset constrs_1 {{{board_xdc_path}}}"""
 if {{[llength $xdc_files] > 0}} {{ add_files -fileset constrs_1 $xdc_files }}
 {xdc_block}
 update_compile_order -fileset sources_1"""
+    board_part_line = ""
+    if args.board_part:
+        board_part_line = f"""
+set_property board_part {{{args.board_part}}} [current_project]
+va_assert_project_property board_part {{{args.board_part}}}
+"""
 
     top_line = f"set_property top {{{args.top}}} [current_fileset]" if args.top else "# top inferred"
     pl_rtl_block = ""
@@ -894,7 +901,7 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \\
     -config {{make_external "FIXED_IO, DDR"}} [get_bd_cells ps7_0]
 {ps_uart_property_tcl}
-set_property -dict [list CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
+set_property -dict [list CONFIG.PCW_FPGA_FCLK0_ENABLE {{1}} CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins ps7_0/M_AXI_GP0_ACLK]
 va_phase "bd_design_review"
 va_assert_bd_cell ps7_0
@@ -936,7 +943,7 @@ create_bd_design {{{args.bd_name}}}
 create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \\
     -config {{make_external "FIXED_IO, DDR"}} [get_bd_cells ps7_0]
-set_property -dict [list CONFIG.PCW_USE_M_AXI_GP0 {{1}} CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
+set_property -dict [list CONFIG.PCW_USE_M_AXI_GP0 {{1}} CONFIG.PCW_FPGA_FCLK0_ENABLE {{1}} CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins ps7_0/M_AXI_GP0_ACLK]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst_ps7_0
@@ -1028,6 +1035,11 @@ proc va_assert_run_ok {{run_name}} {{
         va_fail "Run $run_name did not complete: $status / $progress"
     }}
 }}
+proc va_assert_project_property {{prop expected}} {{
+    set actual [get_property $prop [current_project]]
+    puts "Project property check: $prop=$actual"
+    if {{$actual ne $expected}} {{ va_fail "Project property $prop expected '$expected' but got '$actual'" }}
+}}
 proc va_assert_bd_pin_connected {{pin_name}} {{
     set pins [get_bd_pins -quiet $pin_name]
     if {{[llength $pins] == 0}} {{ va_fail "Required BD pin not found: $pin_name" }}
@@ -1082,6 +1094,7 @@ cd $parent_dir
 
 va_phase "create_project"
 create_project $project_name $project_dir -part $part -force
+{board_part_line}
 set_property target_language {{{args.language}}} [current_project]
 set_property simulator_language Mixed [current_project]
 set_property TARGET_SIMULATOR XSim [current_project]
@@ -1172,8 +1185,43 @@ def write_debug_summary(root: Path, automation: Path, extra_logs: Iterable[Path]
         *[str(path) for path in log_paths if path.exists()],
         "",
     ]
+    xsa_report = automation / "xsa_inspection.json"
+    if xsa_report.exists():
+        body.extend(["XSA inspection:", xsa_report.read_text(encoding="utf-8", errors="replace"), ""])
     write_text(summary, "\n".join(body))
     return summary
+
+
+def inspect_xsa(xsa: Path) -> dict:
+    if not xsa.exists():
+        raise RuntimeError(f"Expected XSA was not created: {xsa}")
+    try:
+        with zipfile.ZipFile(xsa) as archive:
+            names = archive.namelist()
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"XSA is not a readable zip archive: {xsa}") from exc
+    bit_files = [name for name in names if name.lower().endswith(".bit")]
+    hwh_files = [name for name in names if name.lower().endswith(".hwh")]
+    xsa_info = {
+        "xsa": str(xsa),
+        "entry_count": len(names),
+        "bit_files": bit_files,
+        "hwh_files": hwh_files,
+    }
+    if not bit_files:
+        raise RuntimeError(f"XSA does not contain a bitstream. Re-export with write_hw_platform -include_bit: {xsa}")
+    if not hwh_files:
+        raise RuntimeError(f"XSA does not contain an HWH hardware handoff file: {xsa}")
+    return xsa_info
+
+
+def verify_exported_hardware(root: Path, name: str, automation: Path) -> Path:
+    xsa = root / f"{name}.xsa"
+    info = inspect_xsa(xsa)
+    report = automation / "xsa_inspection.json"
+    write_text(report, json.dumps(info, indent=2))
+    print(f"Verified XSA contains bitstream and HWH: {xsa}")
+    return report
 
 
 def read_last_phase(automation: Path) -> str:
@@ -1196,6 +1244,7 @@ def hard_rtl_workflow_cmd(args: argparse.Namespace) -> int:
         "name": args.name,
         "vivado_project_dir": str(root),
         "part": args.part,
+        "board_part": args.board_part,
         "bd_mode": args.bd_mode,
         "src_dir": str(workflow_path(root, args.src_dir)),
         "xdc_dir": str(workflow_path(root, args.xdc_dir)),
@@ -1212,12 +1261,19 @@ def hard_rtl_workflow_cmd(args: argparse.Namespace) -> int:
         require_host_can_run(vivado)
         try:
             run_vivado(vivado, tcl, root.parent, automation / "vivado_run.log", automation / "stage_logs")
+            if args.export_hw:
+                verify_exported_hardware(root, args.name, automation)
             summary = write_debug_summary(root, automation, [])
             print(f"Wrote debug summary: {summary}")
         except subprocess.CalledProcessError as exc:
             summary = write_debug_summary(root, automation, [])
             print(f"Wrote debug summary: {summary}")
             raise SystemExit(exc.returncode)
+        except RuntimeError as exc:
+            print(f"VA_ERROR: {exc}")
+            summary = write_debug_summary(root, automation, [])
+            print(f"Wrote debug summary: {summary}")
+            raise SystemExit(1)
     else:
         print("Plan-only mode: no Vivado execution was requested.")
     return 0
@@ -1493,6 +1549,7 @@ def build_parser() -> argparse.ArgumentParser:
     hard.add_argument("--name", required=True)
     hard.add_argument("--root", required=True, help="One clean project root owned by this workflow")
     hard.add_argument("--part", required=True)
+    hard.add_argument("--board-part", default="", help="Vivado board_part, for example tul.com.tw:pynq-z2:part0:1.0")
     hard.add_argument("--top", default="")
     hard.add_argument("--src-dir", default="./src/hdl")
     hard.add_argument("--sim-dir", default="./src/tb")
