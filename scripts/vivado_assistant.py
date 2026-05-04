@@ -12,9 +12,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
@@ -136,6 +139,78 @@ def version_key(version: str) -> str:
     return "vivado_" + version.replace(".", "_")
 
 
+def looks_like_windows_path(value: str) -> bool:
+    return len(value) >= 3 and value[1:3] in {":\\", ":/"}
+
+
+def resolve_vivado_launcher(raw: str) -> tuple[str, list[str]]:
+    """Resolve common Vivado path inputs to bin/vivado.bat or vivado executable.
+
+    Users and agents often paste a Start Menu folder, an unwrapped/win64.o
+    directory, or the executable itself. This function keeps path choice
+    deterministic and prevents agents from running Tcl in the wrong folder.
+    """
+    notes: list[str] = []
+    if not raw:
+        return "", ["empty path"]
+
+    expanded = os.path.expandvars(str(raw).strip().strip('"'))
+    p = Path(expanded)
+    candidates: list[Path] = []
+
+    if p.is_file():
+        candidates.append(p)
+    if p.is_dir():
+        candidates.extend(
+            [
+                p / "vivado.bat",
+                p / "vivado.exe",
+                p / "bin" / "vivado.bat",
+                p / "bin" / "vivado.exe",
+            ]
+        )
+        for parent in [p, *p.parents]:
+            candidates.extend([parent / "bin" / "vivado.bat", parent / "bin" / "vivado.exe"])
+            if parent.name.lower() == "bin":
+                candidates.extend([parent / "vivado.bat", parent / "vivado.exe"])
+
+    seen: set[str] = set()
+    def candidate_rank(path: Path) -> tuple[int, int]:
+        text = str(path).lower().replace("/", "\\")
+        is_bat = 0 if path.name.lower() == "vivado.bat" else 1
+        is_wrapped_bin = 0 if "\\bin\\vivado.bat" in text and "\\unwrapped\\" not in text else 1
+        return (is_bat, is_wrapped_bin)
+
+    for candidate in sorted(candidates, key=candidate_rank):
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists() and candidate.name.lower() in {"vivado.bat", "vivado.exe", "vivado"}:
+            return str(candidate.resolve()), notes
+
+    if p.exists():
+        notes.append(f"path exists but no Vivado launcher was found under it: {p}")
+    else:
+        notes.append(f"path does not exist from this shell: {p}")
+    notes.append("expected a Vivado install launcher such as <Vivado>/<version>/bin/vivado.bat")
+    return str(p), notes
+
+
+def require_host_can_run(vivado: str) -> None:
+    if platform.system().lower() != "windows" and looks_like_windows_path(vivado):
+        raise SystemExit(
+            "This shell is not Windows, but the Vivado path is a Windows path. "
+            "Run this command from the Windows environment that owns Vivado so "
+            "the automation can execute Vivado and inspect logs directly."
+        )
+
+
+def workflow_path(root: Path, value: str) -> Path:
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
 def configured_vivados(config: dict[str, str]) -> dict[str, str]:
     return {key: value for key, value in config.items() if key.startswith("vivado_") and value}
 
@@ -154,7 +229,7 @@ def resolve_vivado(args: argparse.Namespace, preferred: str = "") -> str:
     config = load_config(getattr(args, "assistant_config", None))
     default_version = config.get("default_vivado_version", "")
     default_key = version_key(default_version) if default_version else ""
-    return (
+    selected = (
         (config.get(version_key(preferred)) if preferred else "")
         or (config.get(preferred) if preferred else "")
         or config.get(default_key, "")
@@ -163,6 +238,12 @@ def resolve_vivado(args: argparse.Namespace, preferred: str = "") -> str:
         or config.get("vivado", "")
         or "vivado"
     )
+    resolved, notes = resolve_vivado_launcher(selected)
+    if notes and selected != "vivado":
+        print("WARNING: could not normalize Vivado path:")
+        for note in notes:
+            print(f"  - {note}")
+    return resolved
 
 
 def resolve_versioned_vivado(
@@ -184,9 +265,15 @@ def init_config_cmd(args: argparse.Namespace) -> int:
 
     config = load_config(args.assistant_config)
     if args.vivado_2020_2:
-        config["vivado_2020_2"] = str(Path(args.vivado_2020_2).resolve())
+        path, notes = resolve_vivado_launcher(args.vivado_2020_2)
+        if notes:
+            raise SystemExit("Invalid Vivado 2020.2 path:\n  - " + "\n  - ".join(notes))
+        config["vivado_2020_2"] = path
     if args.vivado_2021_1:
-        config["vivado_2021_1"] = str(Path(args.vivado_2021_1).resolve())
+        path, notes = resolve_vivado_launcher(args.vivado_2021_1)
+        if notes:
+            raise SystemExit("Invalid Vivado 2021.1 path:\n  - " + "\n  - ".join(notes))
+        config["vivado_2021_1"] = path
 
     default_version = args.default_version
     if default_version == "auto":
@@ -713,9 +800,453 @@ close_hw_manager
     )
 
 
+def write_hard_rtl_workflow_tcl(args: argparse.Namespace, out_dir: Path) -> Path:
+    """Write one ordered Tcl state machine for a complete Vivado project flow."""
+    script = out_dir / "run_workflow.tcl"
+    root = Path(args.root).resolve()
+    project_dir = root.resolve().as_posix()
+    parent_dir = root.parent.resolve().as_posix()
+    src_dir = workflow_path(root, args.src_dir).as_posix()
+    sim_dir = workflow_path(root, args.sim_dir).as_posix()
+    xdc_dir = workflow_path(root, args.xdc_dir).as_posix()
+    bd_mode = args.bd_mode
+    xdc_lines = []
+    if args.xdc:
+        xdc_path = workflow_path(root, args.xdc)
+        xdc_lines.append(
+            f"""if {{![file exists {{{xdc_path.as_posix()}}}]}} {{ va_fail "Requested XDC does not exist: {xdc_path.as_posix()}" }}
+add_files -fileset constrs_1 {{{xdc_path.as_posix()}}}"""
+        )
+    board_xdc = resolve_board_xdc(args)
+    if board_xdc:
+        board_xdc_path = Path(board_xdc).resolve().as_posix()
+        xdc_lines.append(
+            f"""if {{![file exists {{{board_xdc_path}}}]}} {{ va_fail "Registered board XDC does not exist: {board_xdc_path}" }}
+add_files -fileset constrs_1 {{{board_xdc_path}}}"""
+        )
+    xdc_block = "\n".join(xdc_lines) if xdc_lines else 'puts "No explicit XDC files requested."'
+    xdc_glob_block = f"""set xdc_files [glob -nocomplain {{{xdc_dir}/*.xdc}}]
+if {{[llength $xdc_files] > 0}} {{ add_files -fileset constrs_1 $xdc_files }}
+{xdc_block}
+update_compile_order -fileset sources_1"""
+
+    top_line = f"set_property top {{{args.top}}} [current_fileset]" if args.top else "# top inferred"
+    pl_rtl_block = ""
+    bd_block = ""
+    export_hw = "1" if args.export_hw else "0"
+    uart_props = {
+        "none": "",
+        "uart0": (
+            "CONFIG.PCW_UART0_PERIPHERAL_ENABLE {1} "
+            "CONFIG.PCW_UART0_UART0_IO {MIO 14 .. 15} "
+            "CONFIG.PCW_UART0_GRP_FULL_ENABLE {0} "
+            "CONFIG.PCW_UART0_BAUD_RATE {115200} "
+            "CONFIG.PCW_UART_PERIPHERAL_FREQMHZ {50}"
+        ),
+        "uart1": (
+            "CONFIG.PCW_UART1_PERIPHERAL_ENABLE {1} "
+            "CONFIG.PCW_UART1_UART1_IO {MIO 48 .. 49} "
+            "CONFIG.PCW_UART1_GRP_FULL_ENABLE {0} "
+            "CONFIG.PCW_UART1_BAUD_RATE {115200} "
+            "CONFIG.PCW_UART_PERIPHERAL_FREQMHZ {50}"
+        ),
+    }[args.ps_uart]
+    ps_uart_property_tcl = (
+        f"set_property -dict [list {uart_props}] [get_bd_cells ps7_0]"
+        if uart_props
+        else 'puts "No PS UART requested."'
+    )
+    ps_uart_assert_tcl = (
+        f"va_assert_ps_uart ps7_0 {args.ps_uart}"
+        if args.ps_uart != "none"
+        else 'puts "No PS UART assertion requested."'
+    )
+    if bd_mode == "none":
+        pl_rtl_block = f"""
+va_phase "pl_add_verilog"
+set src_count 0
+foreach pattern [list {{{src_dir}/*.v}} {{{src_dir}/*.sv}} {{{src_dir}/*.vhd}} {{{src_dir}/*.vhdl}}] {{
+    set files [glob -nocomplain $pattern]
+    if {{[llength $files] > 0}} {{
+        add_files -fileset sources_1 $files
+        incr src_count [llength $files]
+    }}
+}}
+if {{$src_count == 0}} {{ va_fail "No HDL files found in {src_dir}; refusing to run an empty PL RTL flow." }}
+foreach pattern [list {{{sim_dir}/*.v}} {{{sim_dir}/*.sv}} {{{sim_dir}/*.vhd}} {{{sim_dir}/*.vhdl}}] {{
+    set files [glob -nocomplain $pattern]
+    if {{[llength $files] > 0}} {{ add_files -fileset sim_1 $files }}
+}}
+{top_line}
+update_compile_order -fileset sources_1
+va_phase "pl_design_review"
+va_assert_project_top
+report_compile_order -fileset sources_1
+
+va_phase "pl_add_xdc"
+{xdc_glob_block}
+"""
+    elif bd_mode == "zynq-ps":
+        bd_block = f"""
+va_phase "bd_create_connect_validate"
+create_bd_design {{{args.bd_name}}}
+create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0
+apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \\
+    -config {{make_external "FIXED_IO, DDR"}} [get_bd_cells ps7_0]
+{ps_uart_property_tcl}
+set_property -dict [list CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins ps7_0/M_AXI_GP0_ACLK]
+va_phase "bd_design_review"
+va_assert_bd_cell ps7_0
+va_assert_bd_intf_port DDR
+va_assert_bd_intf_port FIXED_IO
+va_assert_bd_intf_pin_connected ps7_0/DDR
+va_assert_bd_intf_pin_connected ps7_0/FIXED_IO
+va_assert_bd_pin_connected ps7_0/FCLK_CLK0
+va_assert_bd_pin_connected ps7_0/M_AXI_GP0_ACLK
+{ps_uart_assert_tcl}
+validate_bd_design
+save_bd_design
+write_bd_tcl -force [file join {{{out_dir.resolve().as_posix()}}} {{{args.bd_name}.tcl}}]
+
+va_phase "bd_output_products"
+set bd_objects [get_files -quiet -filter {{FILE_TYPE == "Block Designs"}}]
+if {{[llength $bd_objects] == 0}} {{ va_fail "No block design objects found after BD creation." }}
+generate_target all $bd_objects
+export_ip_user_files -of_objects $bd_objects -no_script -sync -force -quiet
+
+va_phase "bd_generate_wrapper"
+set wrapper [make_wrapper -files [get_files {{{args.bd_name}.bd}}] -top]
+add_files -norecurse $wrapper
+set_property top {{{args.bd_name}_wrapper}} [current_fileset]
+update_compile_order -fileset sources_1
+
+va_phase "bd_add_xdc"
+{xdc_glob_block}
+"""
+    elif bd_mode == "zynq-axi-gpio":
+        gpio_props = (
+            f"CONFIG.C_GPIO_WIDTH {{{args.gpio_width}}} CONFIG.C_ALL_INPUTS {{1}} CONFIG.C_IS_DUAL {{0}}"
+            if args.gpio_direction == "input"
+            else f"CONFIG.C_GPIO_WIDTH {{{args.gpio_width}}} CONFIG.C_ALL_OUTPUTS {{1}} CONFIG.C_IS_DUAL {{0}}"
+        )
+        bd_block = f"""
+va_phase "bd_create_connect_validate"
+create_bd_design {{{args.bd_name}}}
+create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0
+apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \\
+    -config {{make_external "FIXED_IO, DDR"}} [get_bd_cells ps7_0]
+set_property -dict [list CONFIG.PCW_USE_M_AXI_GP0 {{1}} CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins ps7_0/M_AXI_GP0_ACLK]
+
+create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst_ps7_0
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins rst_ps7_0/slowest_sync_clk]
+connect_bd_net [get_bd_pins ps7_0/FCLK_RESET0_N] [get_bd_pins rst_ps7_0/ext_reset_in]
+create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 const_vcc
+set_property CONFIG.CONST_VAL {{1}} [get_bd_cells const_vcc]
+connect_bd_net [get_bd_pins const_vcc/dout] [get_bd_pins rst_ps7_0/dcm_locked]
+
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic_0
+set_property -dict [list CONFIG.NUM_MI {{1}}] [get_bd_cells axi_ic_0]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins axi_ic_0/ACLK]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins axi_ic_0/S00_ACLK]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins axi_ic_0/M00_ACLK]
+connect_bd_net [get_bd_pins rst_ps7_0/interconnect_aresetn] [get_bd_pins axi_ic_0/ARESETN]
+connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] [get_bd_pins axi_ic_0/S00_ARESETN]
+connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] [get_bd_pins axi_ic_0/M00_ARESETN]
+connect_bd_intf_net [get_bd_intf_pins ps7_0/M_AXI_GP0] [get_bd_intf_pins axi_ic_0/S00_AXI]
+
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_gpio:2.0 axi_gpio_0
+set_property -dict [list {gpio_props}] [get_bd_cells axi_gpio_0]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins axi_gpio_0/s_axi_aclk]
+connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] [get_bd_pins axi_gpio_0/s_axi_aresetn]
+connect_bd_intf_net [get_bd_intf_pins axi_ic_0/M00_AXI] [get_bd_intf_pins axi_gpio_0/S_AXI]
+make_bd_intf_pins_external [get_bd_intf_pins axi_gpio_0/GPIO]
+set_property name {{{args.gpio_port_name}}} [get_bd_intf_ports GPIO_0]
+assign_bd_address
+va_phase "bd_design_review"
+va_assert_bd_cell ps7_0
+va_assert_bd_cell rst_ps7_0
+va_assert_bd_cell axi_ic_0
+va_assert_bd_cell axi_gpio_0
+va_assert_bd_intf_port DDR
+va_assert_bd_intf_port FIXED_IO
+va_assert_bd_intf_port {{{args.gpio_port_name}}}
+va_assert_bd_pin_connected ps7_0/FCLK_CLK0
+va_assert_bd_pin_connected ps7_0/M_AXI_GP0_ACLK
+va_assert_bd_pin_connected rst_ps7_0/slowest_sync_clk
+va_assert_bd_pin_connected rst_ps7_0/dcm_locked
+va_assert_bd_pin_connected axi_gpio_0/s_axi_aclk
+va_assert_bd_pin_connected axi_gpio_0/s_axi_aresetn
+va_assert_bd_intf_pin_connected ps7_0/M_AXI_GP0
+va_assert_bd_intf_pin_connected axi_ic_0/S00_AXI
+va_assert_bd_intf_pin_connected axi_ic_0/M00_AXI
+va_assert_bd_intf_pin_connected axi_gpio_0/S_AXI
+va_assert_bd_intf_pin_connected axi_gpio_0/GPIO
+va_assert_bd_addressed
+validate_bd_design
+save_bd_design
+write_bd_tcl -force [file join {{{out_dir.resolve().as_posix()}}} {{{args.bd_name}.tcl}}]
+
+va_phase "bd_output_products"
+set bd_objects [get_files -quiet -filter {{FILE_TYPE == "Block Designs"}}]
+if {{[llength $bd_objects] == 0}} {{ va_fail "No block design objects found after BD creation." }}
+generate_target all $bd_objects
+export_ip_user_files -of_objects $bd_objects -no_script -sync -force -quiet
+
+va_phase "bd_generate_wrapper"
+set wrapper [make_wrapper -files [get_files {{{args.bd_name}.bd}}] -top]
+add_files -norecurse $wrapper
+set_property top {{{args.bd_name}_wrapper}} [current_fileset]
+update_compile_order -fileset sources_1
+
+va_phase "bd_add_xdc"
+{xdc_glob_block}
+"""
+
+    return write_text(
+        script,
+        f"""# HARD Vivado workflow Tcl. Do not edit by hand; regenerate from vivado_assistant.py.
+set root_dir {{{root.as_posix()}}}
+set parent_dir {{{parent_dir}}}
+set project_name {{{args.name}}}
+set project_dir {{{project_dir}}}
+set part {{{args.part}}}
+
+proc va_phase {{name}} {{
+    puts "\\n===== VA_PHASE $name ====="
+}}
+proc va_fail {{message}} {{
+    puts "VA_ERROR: $message"
+    error $message
+}}
+proc va_assert_run_ok {{run_name}} {{
+    set status [get_property STATUS [get_runs $run_name]]
+    set progress [get_property PROGRESS [get_runs $run_name]]
+    puts "Run $run_name status=$status progress=$progress"
+    if {{![string match "*Complete*" $status] && ![string match "100%" $progress]}} {{
+        va_fail "Run $run_name did not complete: $status / $progress"
+    }}
+}}
+proc va_assert_bd_pin_connected {{pin_name}} {{
+    set pins [get_bd_pins -quiet $pin_name]
+    if {{[llength $pins] == 0}} {{ va_fail "Required BD pin not found: $pin_name" }}
+    set nets [get_bd_nets -quiet -of_objects $pins]
+    if {{[llength $nets] == 0}} {{ va_fail "Required BD pin is not connected: $pin_name" }}
+}}
+proc va_assert_project_top {{}} {{
+    set top [get_property top [current_fileset]]
+    puts "Project top check: $top"
+    if {{$top eq ""}} {{ va_fail "No top module/entity is selected after HDL insertion." }}
+}}
+proc va_assert_bd_cell {{cell_name}} {{
+    set cells [get_bd_cells -quiet $cell_name]
+    if {{[llength $cells] == 0}} {{ va_fail "Required BD cell not found: $cell_name" }}
+}}
+proc va_assert_bd_intf_port {{port_name}} {{
+    set ports [get_bd_intf_ports -quiet $port_name]
+    if {{[llength $ports] == 0}} {{ va_fail "Required BD interface port not found: $port_name" }}
+}}
+proc va_assert_bd_intf_pin_connected {{pin_name}} {{
+    set pins [get_bd_intf_pins -quiet $pin_name]
+    if {{[llength $pins] == 0}} {{ va_fail "Required BD interface pin not found: $pin_name" }}
+    set nets [get_bd_intf_nets -quiet -of_objects $pins]
+    if {{[llength $nets] == 0}} {{ va_fail "Required BD interface pin is not connected: $pin_name" }}
+}}
+proc va_assert_bd_addressed {{}} {{
+    set segs [get_bd_addr_segs -quiet]
+    puts "BD address segment count: [llength $segs]"
+    if {{[llength $segs] == 0}} {{ va_fail "No BD address segments found after assign_bd_address." }}
+}}
+proc va_assert_ps_uart {{cell_name uart_name}} {{
+    set cells [get_bd_cells -quiet $cell_name]
+    if {{[llength $cells] == 0}} {{ va_fail "Required PS cell not found: $cell_name" }}
+    if {{$uart_name eq "uart0"}} {{
+        set enable_prop CONFIG.PCW_UART0_PERIPHERAL_ENABLE
+        set io_prop CONFIG.PCW_UART0_UART0_IO
+    }} elseif {{$uart_name eq "uart1"}} {{
+        set enable_prop CONFIG.PCW_UART1_PERIPHERAL_ENABLE
+        set io_prop CONFIG.PCW_UART1_UART1_IO
+    }} else {{
+        va_fail "Unsupported PS UART assertion: $uart_name"
+    }}
+    set enabled [get_property $enable_prop $cells]
+    set io [get_property $io_prop $cells]
+    puts "PS UART check: $uart_name enabled=$enabled io=$io"
+    if {{$enabled ne "1"}} {{ va_fail "$uart_name is required by design intent but is not enabled on $cell_name" }}
+    if {{$io eq ""}} {{ va_fail "$uart_name is enabled but has no MIO assignment on $cell_name" }}
+}}
+
+file mkdir $parent_dir
+cd $parent_dir
+
+va_phase "create_project"
+create_project $project_name $project_dir -part $part -force
+set_property target_language {{{args.language}}} [current_project]
+set_property simulator_language Mixed [current_project]
+set_property TARGET_SIMULATOR XSim [current_project]
+
+{pl_rtl_block}
+{bd_block}
+
+va_phase "synthesis"
+set_property strategy {{{args.synth_strategy}}} [get_runs synth_1]
+launch_runs synth_1 -jobs {args.jobs}
+wait_on_run synth_1
+va_assert_run_ok synth_1
+open_run synth_1
+report_timing_summary -delay_type max -max_paths 20
+report_utilization
+
+va_phase "implementation_bitstream"
+set_property strategy {{{args.impl_strategy}}} [get_runs impl_1]
+launch_runs impl_1 -to_step write_bitstream -jobs {args.jobs}
+wait_on_run impl_1
+va_assert_run_ok impl_1
+open_run impl_1
+report_timing_summary -delay_type min_max -max_paths 20
+report_utilization -hierarchical
+report_drc
+set impl_dir [get_property DIRECTORY [get_runs impl_1]]
+set bit_files [glob -nocomplain [file join $impl_dir *.bit]]
+if {{[llength $bit_files] == 0}} {{ va_fail "Vivado implementation completed, but no .bit file was found in $impl_dir" }}
+puts "Bitstream: [lindex $bit_files 0]"
+
+va_phase "hardware_export"
+if {{{export_hw}}} {{
+    write_hw_platform -fixed -include_bit -force -file [file join $project_dir {{{args.name}.xsa}}]
+}}
+
+va_phase "done"
+puts "Workflow complete under $root_dir"
+close_project
+""",
+    )
+
+
+def collect_vivado_diagnostics(log_paths: Iterable[Path]) -> str:
+    patterns = [
+        re.compile(r"VA_PHASE", re.IGNORECASE),
+        re.compile(r"VA_ERROR", re.IGNORECASE),
+        re.compile(r"\bERROR:", re.IGNORECASE),
+        re.compile(r"CRITICAL WARNING", re.IGNORECASE),
+        re.compile(r"failed|no such file|invalid command|cannot|can't", re.IGNORECASE),
+    ]
+    lines: list[str] = []
+    seen: set[tuple[str, int]] = set()
+    for log_path in log_paths:
+        if not log_path.exists() or not log_path.is_file():
+            continue
+        try:
+            content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for idx, line in enumerate(content, start=1):
+            if any(pattern.search(line) for pattern in patterns):
+                key = (str(log_path), idx)
+                if key not in seen:
+                    seen.add(key)
+                    lines.append(f"{log_path}:{idx}: {line}")
+    if not lines:
+        return "No obvious ERROR/CRITICAL WARNING/VA_ERROR lines found in collected logs."
+    return "\n".join(lines[-120:])
+
+
+def write_debug_summary(root: Path, automation: Path, extra_logs: Iterable[Path]) -> Path:
+    log_paths = [
+        automation / "vivado_run.log",
+        root / "vivado.log",
+        root / "vivado.jou",
+        *extra_logs,
+    ]
+    summary = automation / "debug_summary.txt"
+    body = [
+        "Vivado Automation Debug Summary",
+        f"root: {root}",
+        f"last_phase: {read_last_phase(automation)}",
+        "",
+        "Key log lines:",
+        collect_vivado_diagnostics(log_paths),
+        "",
+        "Checked logs:",
+        *[str(path) for path in log_paths if path.exists()],
+        "",
+    ]
+    write_text(summary, "\n".join(body))
+    return summary
+
+
+def read_last_phase(automation: Path) -> str:
+    phase_file = automation / "last_phase.txt"
+    if phase_file.exists():
+        return phase_file.read_text(encoding="utf-8", errors="replace").strip()
+    return "unknown"
+
+
+def hard_rtl_workflow_cmd(args: argparse.Namespace) -> int:
+    if not args.run and not args.plan_only:
+        raise SystemExit("run-rtl-workflow is an execution command. Pass --run, or pass --plan-only only for dry planning.")
+    if args.plan_only and args.run:
+        raise SystemExit("Use either --run or --plan-only, not both.")
+    root = Path(args.root).resolve()
+    automation = Path(args.automation_dir).resolve() if args.automation_dir else Path(tempfile.gettempdir()) / "vivado_assistant" / args.name
+    ensure_dir(automation)
+    manifest = {
+        "workflow": "hard-rtl",
+        "name": args.name,
+        "vivado_project_dir": str(root),
+        "part": args.part,
+        "bd_mode": args.bd_mode,
+        "src_dir": str(workflow_path(root, args.src_dir)),
+        "xdc_dir": str(workflow_path(root, args.xdc_dir)),
+        "vivado_version": args.vivado_version,
+        "automation_dir": str(automation),
+    }
+    write_text(automation / "workflow_manifest.json", json.dumps(manifest, indent=2))
+    tcl = write_hard_rtl_workflow_tcl(args, automation)
+    vivado = resolve_vivado(args, args.vivado_version)
+    print(f"Wrote manifest: {automation / 'workflow_manifest.json'}")
+    print(f"Wrote hard workflow Tcl: {tcl}")
+    print(f"Resolved Vivado: {vivado}")
+    if args.run:
+        require_host_can_run(vivado)
+        try:
+            run_vivado(vivado, tcl, root.parent, automation / "vivado_run.log", automation / "stage_logs")
+            summary = write_debug_summary(root, automation, [])
+            print(f"Wrote debug summary: {summary}")
+        except subprocess.CalledProcessError as exc:
+            summary = write_debug_summary(root, automation, [])
+            print(f"Wrote debug summary: {summary}")
+            raise SystemExit(exc.returncode)
+    else:
+        print("Plan-only mode: no Vivado execution was requested.")
+    return 0
+
+
+def doctor_cmd(args: argparse.Namespace) -> int:
+    print(f"Host OS: {platform.system()} {platform.release()}")
+    config = load_config(args.assistant_config)
+    if config:
+        print(f"Config: {Path(args.assistant_config).resolve()}")
+        for key, value in configured_vivados(config).items():
+            resolved, notes = resolve_vivado_launcher(value)
+            print(f"{key}: {value}")
+            print(f"  resolved: {resolved}")
+            for note in notes:
+                print(f"  WARNING: {note}")
+    for candidate in args.vivado_candidate:
+        resolved, notes = resolve_vivado_launcher(candidate)
+        print(f"candidate: {candidate}")
+        print(f"  resolved: {resolved}")
+        for note in notes:
+            print(f"  WARNING: {note}")
+    return 0
+
+
 def make_and_maybe_run(script: Path, vivado: str, run: bool, cwd: Path) -> int:
     print(f"Wrote Tcl: {script}")
     if run:
+        require_host_can_run(vivado)
         run_vivado(vivado, script, cwd)
     else:
         print(f"Next: {vivado} -mode batch -source {script}")
@@ -784,9 +1315,56 @@ def program_device_cmd(args: argparse.Namespace) -> int:
     return make_and_maybe_run(write_program_device_tcl(args, out_dir), resolve_vivado(args), args.run, out_dir)
 
 
-def run_vivado(vivado: str, script: Path, cwd: Path) -> None:
+def stage_log_name(stage: str, index: int) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", stage).strip("_") or "unknown"
+    return f"{index:02d}_{safe}.log"
+
+
+def run_vivado(vivado: str, script: Path, cwd: Path, log_path: Path | None = None, stage_log_dir: Path | None = None) -> None:
     cmd = [vivado, "-mode", "batch", "-source", str(script)]
     print("+ " + " ".join(cmd))
+    if log_path:
+        ensure_dir(log_path.parent)
+        stage_log = None
+        stage_index = 0
+        current_stage = "startup"
+        if stage_log_dir:
+            ensure_dir(stage_log_dir)
+        with log_path.open("w", encoding="utf-8", errors="replace") as log:
+            log.write("+ " + " ".join(cmd) + "\n")
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                match = re.search(r"===== VA_PHASE ([^=]+) =====", line)
+                if match and stage_log_dir:
+                    if stage_log:
+                        stage_log.close()
+                    stage_index += 1
+                    current_stage = match.group(1).strip()
+                    (log_path.parent / "last_phase.txt").write_text(current_stage, encoding="utf-8")
+                    stage_log = (stage_log_dir / stage_log_name(current_stage, stage_index)).open(
+                        "w", encoding="utf-8", errors="replace"
+                    )
+                print(line, end="")
+                log.write(line)
+                if stage_log:
+                    stage_log.write(line)
+            return_code = process.wait()
+        if stage_log:
+            stage_log.close()
+        if stage_log_dir and current_stage == "startup":
+            (log_path.parent / "last_phase.txt").write_text(current_stage, encoding="utf-8")
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, cmd)
+        return
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
@@ -897,6 +1475,49 @@ def build_parser() -> argparse.ArgumentParser:
     list_xdc = sub.add_parser("list-board-xdc", help="List registered board XDC paths")
     list_xdc.add_argument("--assistant-config", default=str(default_config_path()))
     list_xdc.set_defaults(func=list_board_xdc_cmd)
+
+    doctor = sub.add_parser("doctor", help="Validate host, config, and Vivado launcher paths")
+    doctor.add_argument("--assistant-config", default=str(default_config_path()))
+    doctor.add_argument(
+        "--vivado-candidate",
+        action="append",
+        default=[],
+        help="Path pasted by a user, such as bin/vivado.bat, an unwrapped/win64.o folder, or another candidate",
+    )
+    doctor.set_defaults(func=doctor_cmd)
+
+    hard = sub.add_parser(
+        "run-rtl-workflow",
+        help="Hard ordered workflow: create project, add files, optional BD, output products, synth, impl, bitstream, XSA",
+    )
+    hard.add_argument("--name", required=True)
+    hard.add_argument("--root", required=True, help="One clean project root owned by this workflow")
+    hard.add_argument("--part", required=True)
+    hard.add_argument("--top", default="")
+    hard.add_argument("--src-dir", default="./src/hdl")
+    hard.add_argument("--sim-dir", default="./src/tb")
+    hard.add_argument("--xdc-dir", default="./src/xdc")
+    hard.add_argument("--xdc", default="", help="Additional exact XDC file")
+    hard.add_argument("--board-name", default="", help="Use registered board XDC from config")
+    hard.add_argument("--language", default="Verilog", choices=["Verilog", "VHDL"])
+    hard.add_argument("--bd-mode", default="none", choices=["none", "zynq-ps", "zynq-axi-gpio"])
+    hard.add_argument("--bd-name", default="design_1")
+    hard.add_argument("--ps-uart", default="none", choices=["none", "uart0", "uart1"], help="Enable and assert a PS UART for serial-print applications")
+    hard.add_argument("--gpio-width", type=int, default=1)
+    hard.add_argument("--gpio-direction", default="input", choices=["input", "output"])
+    hard.add_argument("--gpio-port-name", default="gpio_0")
+    hard.add_argument("--clock-mhz", type=int, default=100)
+    hard.add_argument("--jobs", type=int, default=4)
+    hard.add_argument("--synth-strategy", default="Flow_PerfOptimized_high")
+    hard.add_argument("--impl-strategy", default="Performance_ExplorePostRoutePhysOpt")
+    hard.add_argument("--export-hw", action="store_true", help="Write XSA after bitstream")
+    hard.add_argument("--vivado-version", default="", choices=["", "2020.2", "2021.1"])
+    hard.add_argument("--vivado", default="", help="Override Vivado executable")
+    hard.add_argument("--assistant-config", default=str(default_config_path()))
+    hard.add_argument("--automation-dir", default="", help="Optional external directory for generated Tcl/log/debug files; defaults to system temp")
+    hard.add_argument("--plan-only", action="store_true", help="Generate manifest/Tcl for inspection only; do not use for normal automation")
+    hard.add_argument("--run", action="store_true")
+    hard.set_defaults(func=hard_rtl_workflow_cmd)
 
     create = sub.add_parser("create-project", help="Create a Vivado project from source folders")
     create.add_argument("--name", required=True)

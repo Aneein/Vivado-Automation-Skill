@@ -44,7 +44,86 @@ python .\scripts\vivado_assistant.py init `
 
 This creates `vivado_assistant_config.json` in the current directory. Normal commands use the configured default Vivado, or the only configured Vivado when there is just one.
 
+## Claude Code Guard
+
+This repository includes project-level Claude Code guardrails under `.claude/`.
+
+What it does:
+
+- Injects hard workflow instructions when a Vivado/Vitis prompt is submitted.
+- Blocks ad-hoc `vivado -mode batch -source some_random.tcl` execution.
+- Blocks attempts to execute Windows Vivado/Vitis from Linux/remote Claude Code because automation must run where it can inspect logs directly.
+- Requires full workflows to execute with `python scripts/vivado_assistant.py run-rtl-workflow ... --run`; plan-only generation is only for explicit dry planning.
+
+Recommended Claude Code flow:
+
+```powershell
+/vivado-workflow create a PYNQ-Z2 project with a Zynq AXI GPIO BD and bitstream
+```
+
+Run Claude Code from the same Windows environment that owns Vivado for full automation. The Python CLI should call Vivado directly and inspect logs; do not rely on a user-run batch file as the main path.
+
 ## Basic Vivado Flow Commands
+
+### Recommended Hard Workflow
+
+Use this for normal project work instead of asking an agent to hand-write several Tcl files. It fixes the order:
+
+PL RTL flow:
+
+1. create Vivado project
+2. add Verilog/SystemVerilog/VHDL sources
+3. add XDC to `constrs_1`
+4. run synthesis
+5. run implementation to bitstream
+6. export hardware with included bitstream when requested
+
+BD flow:
+
+1. create Vivado project
+2. create BD, add IP, connect, assign addresses
+3. validate BD
+4. generate output products
+5. generate HDL wrapper
+6. add XDC to `constrs_1`
+7. run synthesis
+8. run implementation to bitstream
+9. export hardware with included bitstream when requested
+
+```powershell
+python .\scripts\vivado_assistant.py doctor `
+  --vivado-candidate "G:\Xilinx\Vivado\2020.2\bin\unwrapped\win64.o"
+```
+
+```powershell
+python .\scripts\vivado_assistant.py run-rtl-workflow `
+  --name my_design `
+  --root C:\work\my_design `
+  --part xc7z020clg400-1 `
+  --top top `
+  --vivado-version 2020.2 `
+  --run
+```
+
+For a Zynq PS + AXI GPIO BD:
+
+```powershell
+python .\scripts\vivado_assistant.py run-rtl-workflow `
+  --name ps_gpio `
+  --root C:\work\ps_gpio `
+  --part xc7z020clg400-1 `
+  --bd-mode zynq-axi-gpio `
+  --gpio-direction input `
+  --gpio-width 1 `
+  --gpio-port-name btn0 `
+  --export-hw `
+  --vivado-version 2020.2 `
+  --run
+```
+
+The command lets Vivado create and own the project directory. Generated automation files are outside the Vivado project by default, under `%TEMP%\vivado_assistant\<name>\`: `workflow_manifest.json`, `run_workflow.tcl`, `vivado_run.log`, `last_phase.txt`, `debug_summary.txt`, and `stage_logs\*.log`. Do not ask the user to run Tcl or bat files manually.
+
+### Single-Stage Commands
 
 Register a board XDC original path:
 

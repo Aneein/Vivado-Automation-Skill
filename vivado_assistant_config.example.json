@@ -1,0 +1,13 @@
+{
+  "vivado_2020_2": "C:\\Xilinx\\Vivado\\2020.2\\bin\\vivado.bat",
+  "vivado_2021_1": "C:\\Xilinx\\Vivado\\2021.1\\bin\\vivado.bat",
+  "default_vivado_version": "2020.2",
+  "default_vivado": "C:\\Xilinx\\Vivado\\2020.2\\bin\\vivado.bat",
+  "boards": {
+    "pynq-z2": {
+      "xdc": "C:\\path\\to\\pynq-z2_v1.0.xdc",
+      "part": "xc7z020clg400-1",
+      "description": "Example board XDC entry; replace with your local path."
+    }
+  }
+}

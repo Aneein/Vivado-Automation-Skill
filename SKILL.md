@@ -1,4 +1,4 @@
----
+﻿---
 name: vivado-assistant-automation
 description: "Script-first Vivado/Vitis automation for project migration between Vivado 2020.2 and 2021.1, clean project rebuilds from user sources, BD Tcl export/recreate flows, and Vitis 2021.1 BSP Makefile patching."
 ---
@@ -9,7 +9,100 @@ You are a script-first Vivado/Vitis automation assistant. Prefer running or gene
 
 ## Core Rule
 
-When the user asks for Vivado project creation, version migration, BD recreation, IP output generation, synthesis, implementation, bitstream, or Vitis BSP Makefile repair, first identify whether an existing command in `scripts/vivado_assistant.py` can do the job. If yes, use that command and only generate extra Tcl when the CLI emits a migration workspace.
+When the user asks for Vivado project creation, source insertion, BD creation, output product generation, synthesis, implementation, bitstream, or hardware export, do not hand-write Tcl. Use the hard workflow command first:
+
+```bash
+python scripts/vivado_assistant.py run-rtl-workflow ... --run
+```
+
+This is an execution command. It must include `--run` for normal automation. The Python CLI calls Vivado itself, streams logs, and writes `vivado_run.log`, per-phase logs under `stage_logs/`, `last_phase.txt`, and `debug_summary.txt` under the external automation directory. It enforces:
+
+1. resolve/validate Vivado launcher
+2. create project
+3. add HDL/XDC/sim files only after the project exists
+4. create BD/wrapper only after the project exists
+5. generate output products
+6. run synthesis
+7. run implementation to bitstream
+8. write bit/bin/XSA outputs into stable project-root folders
+
+Only use the older commands (`create-project`, `create-bd`, `run-synthesis`, etc.) for manual diagnosis or when the user explicitly asks for a single stage.
+
+Do not stop after generating Tcl, do not generate `run_workflow.bat`, and do not ask the user to execute Tcl/bat manually. Use `--plan-only` only when the user explicitly asks not to run Vivado. If a stage fails, read `debug_summary.txt`, `last_phase.txt`, and the matching `stage_logs/<phase>.log` before editing anything.
+
+## Design Intent Closure
+
+Before writing HDL or BD Tcl, translate the user's natural-language goal into a short design checklist. Keep it task-specific:
+
+- user-visible behavior: LEDs, UART text, buttons, DMA transfer, interrupt, memory map, clock rate
+- required design elements: top ports, IP blocks, PS UART, AXI GPIO, reset blocks, clocks, address segments, external interfaces
+- required files: HDL, simulation sources, XDC, BD wrapper, exported XSA, Vitis `main.c`
+- success checks after each design step
+
+Then enforce the checklist after each design step, before moving on:
+
+1. **After Verilog/VHDL generation:** verify top module/entity exists, intended ports exist, state machines/counters/resets match the behavior, and required XDC port names match the HDL ports.
+2. **After adding BD IP:** verify every required IP cell exists. Do not assume `apply_bd_automation` configured intent-specific peripherals.
+3. **After BD wiring:** verify clocks, resets, AXI interfaces, external ports, interrupts, UART, and address segments required by the goal are connected/configured. Then run `validate_bd_design`.
+4. **After wrapper generation:** verify the wrapper is the project top.
+5. **After synthesis/implementation:** read run status, DRC, timing summary, and bit/XSA location.
+
+For serial-print PS designs, explicitly choose the PS UART required by the board, for example `--ps-uart uart1` for the common PYNQ-Z2 USB-UART mapping. The tool must assert the UART is enabled and has MIO assigned. This is one example of the general rule: if the user's goal depends on a peripheral or interface, configure and assert that peripheral or interface explicitly.
+
+## Required Pipelines
+
+Use one of these two normal Vivado pipelines. Each step must complete before the next starts; if one step fails, stop and debug that stage.
+
+### PL RTL Pipeline
+
+1. Create the Vivado project.
+2. Add Verilog/SystemVerilog/VHDL sources.
+3. Run the PL design review: top selected, intended ports present, constraints match ports.
+4. Add XDC constraints to `constrs_1`.
+5. Run synthesis.
+6. Run implementation to `write_bitstream`.
+7. Locate the `.bit` in Vivado's standard `impl_1` run directory.
+8. If hardware export is requested, run `write_hw_platform -include_bit`.
+
+### BD Pipeline
+
+1. Create the Vivado project.
+2. Create the block design.
+3. Add IP/BD devices.
+4. Connect clocks, resets, AXI, external ports, and addresses.
+5. Run the BD design review: required cells exist, required pins/interfaces are connected, addresses exist where needed, board/peripheral-specific settings are explicit.
+6. Run `validate_bd_design`; stop if validation fails.
+7. Generate output products.
+8. Generate HDL wrapper and add it to sources.
+9. Add XDC constraints to `constrs_1`.
+10. Run synthesis.
+11. Run implementation to `write_bitstream`.
+12. Locate the `.bit` in Vivado's standard `impl_1` run directory.
+13. If hardware export is requested, run `write_hw_platform -include_bit`.
+
+These are the only default full-flow sequences. Do not synthesize before wrapper generation in a BD flow. Do not add XDC as an orphan file outside `constrs_1`.
+
+If the agent is running from Linux/WSL and the Vivado path is a Windows path, do not ask the user to copy Tcl errors back and forth. Run the CLI from the Windows environment that owns Vivado so it can execute and inspect logs directly.
+
+Before using a pasted Vivado path, run:
+
+```bash
+python scripts/vivado_assistant.py doctor --vivado-candidate "<pasted path>"
+```
+
+The doctor command must resolve folders such as `bin/unwrapped/win64.o` back to `<Vivado>/<version>/bin/vivado.bat`; Start Menu folders are not valid launchers.
+
+## Claude Code Guard
+
+This skill repository includes project-level Claude Code hooks in `.claude/settings.json` and `.claude/hooks/vivado_guard.py`.
+
+The hooks are part of the intended workflow:
+
+- `UserPromptSubmit` adds hard workflow guidance for Vivado/Vitis prompts.
+- `PreToolUse` for Bash blocks ad-hoc Vivado batch Tcl and blocks Windows Vivado/Vitis execution from Linux/remote Claude Code.
+- The project slash command `/vivado-workflow` reminds Claude Code to use `doctor` and `run-rtl-workflow`.
+
+If these hooks block a command, follow the hook message. Do not bypass it by manually writing new Tcl.
 
 ## Initialization
 
@@ -33,6 +126,8 @@ python scripts/vivado_assistant.py init \
   --vivado-2021-1 "C:/Xilinx/Vivado/2021.1/bin/vivado.bat"
 ```
 
+**Path verification rule:** When a user provides a Vivado path, ALWAYS verify that the path points to an actual executable file (not a directory). Use Glob or Read to confirm the file exists and is the correct entry point (`vivado.bat` on Windows). If the user provides a path like `.../bin/unwrapped/win64.o`, check whether it is a directory (Vivado's internal binary folder) and correct it to `.../bin/vivado.bat`. Do not blindly store unverified paths into config.
+
 This writes `vivado_assistant_config.json` in the current working directory by default. The user may choose the default executable with `--default-version 2020.2` or `--default-version 2021.1`.
 
 After initialization:
@@ -40,6 +135,47 @@ After initialization:
 - Normal project/build commands use the configured default Vivado. If only one Vivado is configured, they use that one.
 - `migrate-project` should use the source and target versions chosen by the user, for example `--source-version 2020.2 --target-version 2021.1`.
 - A specific command may still override the executable with `--vivado`, `--source-vivado`, or `--target-vivado`.
+
+## Project Structure & Path Rules
+
+Vivado owns the project workspace. You are just writing scripts that instruct Vivado 鈥?do not create custom directories alongside the project and redirect Vivado outputs into them. Let Vivado manage its own house.
+
+### Strict Rules
+
+1. **One Vivado project = one directory.** A Vivado project created by `create_project` lives entirely inside its project directory: `<name>.xpr`, `<name>.srcs/`, `<name>.runs/`, `<name>.cache/`, `<name>.gen/`. Do NOT create sibling folders like `bitstreams/`, `reports/`, `hw_export/` at the project root level.
+
+2. **Bitstream must be generated by `launch_runs -to_step write_bitstream`**, not by standalone `write_bitstream`. Reason: `write_hw_platform -include_bit` requires the `.bit` inside the impl run's standard directory. Writing bitstream to a custom path breaks hardware export.
+
+3. **Reports, checkpoints, bitstreams, and run products stay where Vivado puts them.** Do not copy them into custom root-level folders. Use `<project>.runs/impl_1/*.bit` and the standard Vivado logs/reports for diagnosis.
+
+4. **XDC constraints must be added to the project's `constrs_1` fileset.** Do not leave XDC files as orphans outside the project 鈥?Vivado needs them inside the project to use them during implementation.
+
+5. **User-owned source files (HDL, XDC, C) may live wherever the user provides them.** Do not create `src/` automatically. Add existing files to the Vivado project via `add_files`.
+
+6. **Automation scripts/log summaries live outside the Vivado project directory by default.** `run-rtl-workflow` writes generated Tcl/log/debug files under the system temp directory unless the user explicitly passes `--automation-dir`.
+
+### Correct Layout
+```text
+<vivado_project_dir>/
+|-- <name>.xpr
+|-- <name>.srcs/
+|-- <name>.runs/
+|-- <name>.cache/
+|-- <name>.gen/
+`-- .Xil/
+
+Generated automation files are outside this directory by default:
+%TEMP%/vivado_assistant/<name>/run_workflow.tcl
+%TEMP%/vivado_assistant/<name>/vivado_run.log
+%TEMP%/vivado_assistant/<name>/debug_summary.txt
+```
+
+### Common Vivado 2020.2 Tcl Pitfalls
+
+- **`PCW_USE_FCLK0` does not exist.** Setting `PCW_FPGA0_PERIPHERAL_FREQMHZ` to non-zero auto-enables FCLK0.
+- **`M_AXI_GP0_ACLK` must be explicitly connected** to `FCLK_CLK0` after `apply_bd_automation`, otherwise `validate_bd_design` fails.
+- **`proc_sys_reset/dcm_locked` must be driven.** Use `xlconstant` (CONST_VAL=1) to tie it high when FCLK comes directly from PS.
+- **Configure PS properties BEFORE `apply_bd_automation`**, connect `M_AXI_GP0_ACLK` AFTER.
 
 ## Supported Commands
 
@@ -49,6 +185,8 @@ Use these commands for the normal FPGA flow:
 
 | User intent | CLI command |
 | --- | --- |
+| Full ordered RTL/BD/build flow | `run-rtl-workflow --run` |
+| Validate Vivado paths/environment | `doctor` |
 | Create a project | `create-project` |
 | Create a baseline Zynq BD | `create-bd` |
 | Generate IP/BD output products | `generate-output-products` |
@@ -327,3 +465,4 @@ If BD Tcl recreation fails in the target Vivado:
 4. Avoid copying old `.bd` or `.gen` artifacts into the new project as a workaround.
 
 If Vitis Makefile patching finds multiple BSP Makefiles, report all matched paths and patch only when the user asked for workspace-wide repair or provided a specific `--makefile`.
+
