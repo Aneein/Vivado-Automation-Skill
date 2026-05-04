@@ -112,6 +112,7 @@ python .\scripts\vivado_assistant.py run-rtl-workflow `
   --name ps_gpio `
   --root C:\work\ps_gpio `
   --part xc7z020clg400-1 `
+  --board-part tul.com.tw:pynq-z2:part0:1.0 `
   --bd-mode zynq-axi-gpio `
   --gpio-direction input `
   --gpio-width 1 `
@@ -156,7 +157,7 @@ python .\scripts\vivado_assistant.py create-project `
   --run
 ```
 
-Create a baseline Zynq block design:
+Create a baseline Zynq block design for diagnosis only. Prefer `run-rtl-workflow --run` for normal full builds:
 
 ```powershell
 python .\scripts\vivado_assistant.py create-bd `
@@ -198,6 +199,8 @@ python .\scripts\vivado_assistant.py run-synthesis --project C:\work\vivado_proj
 python .\scripts\vivado_assistant.py run-implementation --project C:\work\vivado_project\my_fpga_design.xpr --out C:\work\automation --run
 python .\scripts\vivado_assistant.py generate-bitstream --project C:\work\vivado_project\my_fpga_design.xpr --name my_fpga_design --out C:\work\automation --run
 ```
+
+`generate-bitstream` uses `launch_runs impl_1 -to_step write_bitstream` and reports the `.bit` from Vivado's standard `<project>.runs\impl_1` directory. It does not write extra bit/bin files into a custom `bitstreams` folder.
 
 For RTL PL projects, ask after bitstream whether to open hardware and program the board:
 

@@ -306,11 +306,15 @@ def register_board_xdc_cmd(args: argparse.Namespace) -> int:
     board["xdc"] = str(Path(args.xdc).resolve())
     if args.part:
         board["part"] = args.part
+    if args.board_part:
+        board["board_part"] = args.board_part
     if args.description:
         board["description"] = args.description
     config_path = save_config(config, args.assistant_config)
     print(f"Wrote config: {config_path}")
     print(f"Board {args.board_name}: {board['xdc']}")
+    if board.get("board_part"):
+        print(f"  board_part: {board['board_part']}")
     return 0
 
 
@@ -324,6 +328,8 @@ def list_board_xdc_cmd(args: argparse.Namespace) -> int:
         print(f"{name}: {data.get('xdc', '')}")
         if data.get("part"):
             print(f"  part: {data['part']}")
+        if data.get("board_part"):
+            print(f"  board_part: {data['board_part']}")
         if data.get("description"):
             print(f"  description: {data['description']}")
     return 0
@@ -337,6 +343,17 @@ def resolve_board_xdc(args: argparse.Namespace) -> str:
     return board.get("xdc", "")
 
 
+def resolve_board_part(args: argparse.Namespace) -> str:
+    explicit = getattr(args, "board_part", "")
+    if explicit:
+        return explicit
+    if not getattr(args, "board_name", ""):
+        return ""
+    config = load_config(getattr(args, "assistant_config", None))
+    board = config.get("boards", {}).get(args.board_name, {})
+    return board.get("board_part", "")
+
+
 def find_xpr(project: Path) -> Path:
     if project.is_file() and project.suffix.lower() == ".xpr":
         return project.resolve()
@@ -347,6 +364,15 @@ def find_xpr(project: Path) -> Path:
         preferred = [p for p in matches if ".runs" not in p.parts and ".cache" not in p.parts]
         matches = preferred or matches
     return matches[0].resolve()
+
+
+def find_standard_impl_bit(project: Path) -> Path:
+    xpr = find_xpr(project)
+    impl_dir = xpr.parent / f"{xpr.stem}.runs" / "impl_1"
+    bits = sorted(impl_dir.glob("*.bit"))
+    if not bits:
+        raise FileNotFoundError(f"No standard implementation bitstream found under {impl_dir}")
+    return bits[0].resolve()
 
 
 def parse_xpr_basic(xpr: Path) -> dict[str, str]:
@@ -589,12 +615,17 @@ apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \\
     -config {{make_external "FIXED_IO, DDR"}} [get_bd_cells ps7_0]
 set_property -dict [list \\
     CONFIG.PCW_USE_M_AXI_GP0 {{1}} \\
+    CONFIG.PCW_FPGA_FCLK0_ENABLE {{1}} \\
     CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}} \\
 ] [get_bd_cells ps7_0]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins ps7_0/M_AXI_GP0_ACLK]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst_ps7_0
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins rst_ps7_0/slowest_sync_clk]
 connect_bd_net [get_bd_pins ps7_0/FCLK_RESET0_N] [get_bd_pins rst_ps7_0/ext_reset_in]
+create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 const_vcc
+set_property CONFIG.CONST_VAL {{1}} [get_bd_cells const_vcc]
+connect_bd_net [get_bd_pins const_vcc/dout] [get_bd_pins rst_ps7_0/dcm_locked]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic_0
 set_property -dict [list CONFIG.NUM_MI {{1}}] [get_bd_cells axi_ic_0]
@@ -633,11 +664,12 @@ def write_run_flow_tcl(args: argparse.Namespace, out_dir: Path) -> Path:
     xpr = Path(args.project).resolve().as_posix()
     reports = Path(args.reports_dir).resolve().as_posix()
     checkpoints = Path(args.checkpoint_dir).resolve().as_posix()
-    bitstreams = Path(args.bitstream_dir).resolve().as_posix()
     body = f"""open_project {{{xpr}}}
+"""
+    if args.step in {"synthesis", "implementation"}:
+        body += f"""
 file mkdir {{{reports}}}
 file mkdir {{{checkpoints}}}
-file mkdir {{{bitstreams}}}
 """
     if args.step == "synthesis":
         body += f"""
@@ -665,17 +697,13 @@ write_checkpoint -force {{{checkpoints}/post_route.dcp}}
     elif args.step == "bitstream":
         body += f"""
 set impl_status [get_property STATUS [get_runs impl_1]]
-if {{![string match "*Complete*" $impl_status]}} {{
-    launch_runs impl_1 -to_step write_bitstream -jobs {args.jobs}
-    wait_on_run impl_1
-}} else {{
-    puts "Implementation is already complete: $impl_status"
-}}
+launch_runs impl_1 -to_step write_bitstream -jobs {args.jobs}
+wait_on_run impl_1
 open_run impl_1
-write_bitstream -force {{{bitstreams}/{args.name}.bit}}
-write_bitstream -force -bin_file {{{bitstreams}/{args.name}.bit}}
-set debug_cores [get_debug_cores -quiet]
-if {{[llength $debug_cores] > 0}} {{ write_debug_probes -force {{{bitstreams}/{args.name}.ltx}} }}
+set impl_dir [get_property DIRECTORY [get_runs impl_1]]
+set bit_files [glob -nocomplain [file join $impl_dir *.bit]]
+if {{[llength $bit_files] == 0}} {{ error "Implementation completed, but no .bit file was found in $impl_dir" }}
+puts "Bitstream: [lindex $bit_files 0]"
 """
     body += "# Flow reports/checkpoints are already written explicitly.\nclose_project\n"
     return write_text(script, "# Auto-generated Vivado flow Tcl.\n" + body)
@@ -830,11 +858,12 @@ add_files -fileset constrs_1 {{{board_xdc_path}}}"""
 if {{[llength $xdc_files] > 0}} {{ add_files -fileset constrs_1 $xdc_files }}
 {xdc_block}
 update_compile_order -fileset sources_1"""
+    effective_board_part = resolve_board_part(args)
     board_part_line = ""
-    if args.board_part:
+    if effective_board_part:
         board_part_line = f"""
-set_property board_part {{{args.board_part}}} [current_project]
-va_assert_project_property board_part {{{args.board_part}}}
+set_property board_part {{{effective_board_part}}} [current_project]
+va_assert_project_property board_part {{{effective_board_part}}}
 """
 
     top_line = f"set_property top {{{args.top}}} [current_fileset]" if args.top else "# top inferred"
@@ -901,8 +930,7 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \\
     -config {{make_external "FIXED_IO, DDR"}} [get_bd_cells ps7_0]
 {ps_uart_property_tcl}
-set_property -dict [list CONFIG.PCW_FPGA_FCLK0_ENABLE {{1}} CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
-connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins ps7_0/M_AXI_GP0_ACLK]
+set_property -dict [list CONFIG.PCW_USE_M_AXI_GP0 {{0}} CONFIG.PCW_FPGA_FCLK0_ENABLE {{1}} CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
 va_phase "bd_design_review"
 va_assert_bd_cell ps7_0
 va_assert_bd_intf_port DDR
@@ -910,7 +938,6 @@ va_assert_bd_intf_port FIXED_IO
 va_assert_bd_intf_pin_connected ps7_0/DDR
 va_assert_bd_intf_pin_connected ps7_0/FIXED_IO
 va_assert_bd_pin_connected ps7_0/FCLK_CLK0
-va_assert_bd_pin_connected ps7_0/M_AXI_GP0_ACLK
 {ps_uart_assert_tcl}
 validate_bd_design
 save_bd_design
@@ -1244,7 +1271,7 @@ def hard_rtl_workflow_cmd(args: argparse.Namespace) -> int:
         "name": args.name,
         "vivado_project_dir": str(root),
         "part": args.part,
-        "board_part": args.board_part,
+        "board_part": resolve_board_part(args),
         "bd_mode": args.bd_mode,
         "src_dir": str(workflow_path(root, args.src_dir)),
         "xdc_dir": str(workflow_path(root, args.xdc_dir)),
@@ -1327,7 +1354,7 @@ def run_flow_cmd(args: argparse.Namespace) -> int:
     vivado = resolve_vivado(args)
     make_and_maybe_run(write_run_flow_tcl(args, out_dir), vivado, args.run, out_dir)
     if args.step == "bitstream" and args.run:
-        bit_file = Path(args.bitstream_dir).resolve() / f"{args.name}.bit"
+        bit_file = find_standard_impl_bit(Path(args.project).resolve())
         should_program = getattr(args, "program_device", False)
         if getattr(args, "ask_program_device", False):
             answer = input(f"Bitstream generated at {bit_file}. Open hardware and program device? [y/N] ")
@@ -1524,6 +1551,7 @@ def build_parser() -> argparse.ArgumentParser:
     reg_xdc.add_argument("--board-name", required=True, help="Short board key, e.g. pynq-z2")
     reg_xdc.add_argument("--xdc", required=True, help="Original board XDC file path")
     reg_xdc.add_argument("--part", default="", help="Optional default part for this board")
+    reg_xdc.add_argument("--board-part", default="", help="Optional Vivado board_part, e.g. tul.com.tw:pynq-z2:part0:1.0")
     reg_xdc.add_argument("--description", default="")
     reg_xdc.add_argument("--assistant-config", default=str(default_config_path()))
     reg_xdc.set_defaults(func=register_board_xdc_cmd)
@@ -1641,14 +1669,14 @@ def build_parser() -> argparse.ArgumentParser:
     impl.add_argument("--run", action="store_true")
     impl.set_defaults(func=run_flow_cmd, step="implementation")
 
-    bit = sub.add_parser("generate-bitstream", help="Run implementation to bitstream and collect bit/bin/ltx")
+    bit = sub.add_parser("generate-bitstream", help="Run implementation to standard impl_1 bitstream")
     bit.add_argument("--project", required=True)
     bit.add_argument("--name", required=True)
     bit.add_argument("--strategy", default="Performance_ExplorePostRoutePhysOpt")
     bit.add_argument("--jobs", type=int, default=4)
     bit.add_argument("--reports-dir", default="./reports")
     bit.add_argument("--checkpoint-dir", default="./checkpoints")
-    bit.add_argument("--bitstream-dir", default="./bitstreams")
+    bit.add_argument("--bitstream-dir", default="./bitstreams", help=argparse.SUPPRESS)
     bit.add_argument("--out", required=True)
     bit.add_argument("--vivado", default="", help="Override Vivado executable; defaults to config Vivado 2021.1")
     bit.add_argument("--assistant-config", default=str(default_config_path()))

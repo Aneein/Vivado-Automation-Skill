@@ -7,6 +7,7 @@
     "pynq-z2": {
       "xdc": "C:\\path\\to\\pynq-z2_v1.0.xdc",
       "part": "xc7z020clg400-1",
+      "board_part": "tul.com.tw:pynq-z2:part0:1.0",
       "description": "Example board XDC entry; replace with your local path."
     }
   }

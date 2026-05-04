@@ -199,8 +199,8 @@ Use these commands for the normal FPGA flow:
 | --- | --- |
 | Full ordered RTL/BD/build flow | `run-rtl-workflow --run` |
 | Validate Vivado paths/environment | `doctor` |
-| Create a project | `create-project` |
-| Create a baseline Zynq BD | `create-bd` |
+| Create a project | `create-project` diagnosis only |
+| Create a baseline Zynq BD | `create-bd` diagnosis only |
 | Generate IP/BD output products | `generate-output-products` |
 | Run simulation | `run-simulation` |
 | Run synthesis | `run-synthesis` |
@@ -220,8 +220,11 @@ Do not scatter original board XDC files into random generated folders. When the 
 python scripts/vivado_assistant.py register-board-xdc \
   --board-name my-board \
   --xdc "<path-to-your-board.xdc>" \
-  --part xc7z020clg400-1
+  --part xc7z020clg400-1 \
+  --board-part tul.com.tw:pynq-z2:part0:1.0
 ```
+
+The registered board entry may include `xdc`, `part`, `board_part`, and `description`. `run-rtl-workflow --board-name <name>` must use the registered XDC and, when `--board-part` is not provided explicitly, use the registered `board_part`.
 
 Later, if the user cannot find the XDC, list registered files:
 
