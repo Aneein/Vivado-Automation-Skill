@@ -1,0 +1,55 @@
+# Vivado project files (generated)
+*.xpr
+*.jou
+*.log
+*.str
+
+# Vivado run data
+.runs/
+.cache/
+.hw/
+.sim/
+.ip_user_files/
+.gen/
+
+# IP cache
+ipcache/
+
+# Generated files
+*.dcp
+*.bit
+*.bin
+*.mcs
+*.ltx
+*.wdb
+*.wcfg
+*.pb
+
+# XSim
+xsim.dir/
+*.backup.jou
+*.backup.log
+webtalk*.jou
+webtalk*.log
+
+# Vivado temp
+.vivado/
+.JouTimestamp
+.JouTimestamp.backup
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Config file (user-specific)
+vivado_assistant_config.json
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
