@@ -1,0 +1,8 @@
+interface:
+  display_name: "Vivado Assistant Automation"
+  short_description: "Scripted Vivado/Vitis flows for Zynq and RTL."
+  brand_color: "#2563EB"
+  default_prompt: "Use $vivado-assistant-automation to create, migrate, validate, or debug a Vivado/Vitis project with the scripted workflow."
+
+policy:
+  allow_implicit_invocation: true

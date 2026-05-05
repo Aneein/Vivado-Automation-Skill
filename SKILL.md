@@ -1,4 +1,4 @@
-﻿---
+---
 name: vivado-assistant-automation
 description: "Script-first Vivado/Vitis automation for project migration between Vivado 2020.2 and 2021.1, clean project rebuilds from user sources, BD Tcl export/recreate flows, and Vitis 2021.1 BSP Makefile patching."
 ---
