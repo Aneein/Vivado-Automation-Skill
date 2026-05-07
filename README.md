@@ -1,4 +1,4 @@
-# Vivado Assistant Automation
+﻿# Vivado Assistant Automation
 
 This is a script-first redesign of the Vivado assistant. The old version was mainly a skill template and Tcl snippet library. This version gives the agent concrete automation commands to run.
 
@@ -248,7 +248,7 @@ User-side Vitis flow:
 
 1. Put the generated C/C++ file into `<App_workspace>\<app_name>\src`.
 2. Click `Build Application`.
-3. Click `Run As -> standalone_debug_attach_target_program_and_run`.
+3. Launch with PS initialization enabled so Vitis runs `ps7_init` and `ps7_post_config` before downloading the ELF. Avoid attach-only launches unless the PS has already been initialized; otherwise downloads to DDR, commonly `0x100000`, can fail with `APB Memory access port is disabled`.
 
 The only Vitis automation kept by default is the Vivado/Vitis 2021.1 BSP Makefile patch before build.
 
@@ -356,3 +356,4 @@ The intended flow is:
 6. Generate wrappers and output products.
 7. Upgrade IP if needed.
 8. Build synthesis/implementation/bitstream from the clean target project as a separate step.
+

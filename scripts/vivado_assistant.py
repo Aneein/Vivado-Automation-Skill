@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Vivado Assistant Automation CLI.
 
@@ -957,10 +957,10 @@ va_phase "pl_add_xdc"
 va_phase "bd_create_connect_validate"
 create_bd_design {{{args.bd_name}}}
 create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0
-apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \\
-    -config {{make_external "FIXED_IO, DDR"}} [get_bd_cells ps7_0]
 {ps_uart_property_tcl}
 set_property -dict [list CONFIG.PCW_USE_M_AXI_GP0 {{0}} CONFIG.PCW_FPGA_FCLK0_ENABLE {{1}} CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
+apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \\
+    -config {{make_external "FIXED_IO, DDR"}} [get_bd_cells ps7_0]
 va_phase "bd_design_review"
 va_assert_bd_cell ps7_0
 va_assert_bd_intf_port DDR
@@ -998,9 +998,10 @@ va_phase "bd_add_xdc"
 va_phase "bd_create_connect_validate"
 create_bd_design {{{args.bd_name}}}
 create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0
+{ps_uart_property_tcl}
+set_property -dict [list CONFIG.PCW_USE_M_AXI_GP0 {{1}} CONFIG.PCW_FPGA_FCLK0_ENABLE {{1}} CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \\
     -config {{make_external "FIXED_IO, DDR"}} [get_bd_cells ps7_0]
-set_property -dict [list CONFIG.PCW_USE_M_AXI_GP0 {{1}} CONFIG.PCW_FPGA_FCLK0_ENABLE {{1}} CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {{{args.clock_mhz}}}] [get_bd_cells ps7_0]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0] [get_bd_pins ps7_0/M_AXI_GP0_ACLK]
 
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst_ps7_0
@@ -1038,6 +1039,7 @@ va_assert_bd_intf_port FIXED_IO
 va_assert_bd_intf_port {{{args.gpio_port_name}}}
 va_assert_bd_pin_connected ps7_0/FCLK_CLK0
 va_assert_bd_pin_connected ps7_0/M_AXI_GP0_ACLK
+{ps_uart_assert_tcl}
 va_assert_bd_pin_connected rst_ps7_0/slowest_sync_clk
 va_assert_bd_pin_connected rst_ps7_0/dcm_locked
 va_assert_bd_pin_connected axi_gpio_0/s_axi_aclk
@@ -1259,11 +1261,13 @@ def inspect_xsa(xsa: Path) -> dict:
         raise RuntimeError(f"XSA is not a readable zip archive: {xsa}") from exc
     bit_files = [name for name in names if name.lower().endswith(".bit")]
     hwh_files = [name for name in names if name.lower().endswith(".hwh")]
+    ps7_init_files = [name for name in names if name.lower().endswith("ps7_init.tcl")]
     xsa_info = {
         "xsa": str(xsa),
         "entry_count": len(names),
         "bit_files": bit_files,
         "hwh_files": hwh_files,
+        "ps7_init_files": ps7_init_files,
     }
     if not bit_files:
         raise RuntimeError(f"XSA does not contain a bitstream. Re-export with write_hw_platform -include_bit: {xsa}")
@@ -1272,9 +1276,14 @@ def inspect_xsa(xsa: Path) -> dict:
     return xsa_info
 
 
-def verify_exported_hardware(root: Path, name: str, automation: Path) -> Path:
+def verify_exported_hardware(root: Path, name: str, automation: Path, require_ps_init: bool = False) -> Path:
     xsa = root / f"{name}.xsa"
     info = inspect_xsa(xsa)
+    if require_ps_init and not info["ps7_init_files"]:
+        raise RuntimeError(
+            f"Zynq XSA does not contain ps7_init.tcl. Vitis may fail to download ELF to DDR "
+            f"with APB Memory access port is disabled: {xsa}"
+        )
     report = automation / "xsa_inspection.json"
     write_text(report, json.dumps(info, indent=2))
     print(f"Verified XSA contains bitstream and HWH: {xsa}")
@@ -1293,6 +1302,14 @@ def hard_rtl_workflow_cmd(args: argparse.Namespace) -> int:
         raise SystemExit("run-rtl-workflow is an execution command. Pass --run, or pass --plan-only only for dry planning.")
     if args.plan_only and args.run:
         raise SystemExit("Use either --run or --plan-only, not both.")
+    effective_board_part = resolve_board_part(args)
+    if args.bd_mode.startswith("zynq-") and not effective_board_part:
+        raise SystemExit(
+            "Zynq BD workflows require --board-part or a registered --board-name with board_part. "
+            "Part-only PS7 projects can export XSAs that later fail in Vitis/JTAG with "
+            "APB Memory access port is disabled. For PYNQ-Z2 use: "
+            "--board-part tul.com.tw:pynq-z2:part0:1.0"
+        )
     root = Path(args.root).resolve()
     automation = Path(args.automation_dir).resolve() if args.automation_dir else Path(tempfile.gettempdir()) / "vivado_assistant" / args.name
     ensure_dir(automation)
@@ -1303,6 +1320,10 @@ def hard_rtl_workflow_cmd(args: argparse.Namespace) -> int:
         "part": args.part,
         "board_part": resolve_board_part(args),
         "bd_mode": args.bd_mode,
+        "ps_uart": args.ps_uart,
+        "gpio_width": args.gpio_width,
+        "gpio_direction": args.gpio_direction,
+        "gpio_port_name": args.gpio_port_name,
         "src_dir": str(workflow_path(root, args.src_dir)),
         "xdc_dir": str(workflow_path(root, args.xdc_dir)),
         "vivado_version": args.vivado_version,
@@ -1319,7 +1340,7 @@ def hard_rtl_workflow_cmd(args: argparse.Namespace) -> int:
         try:
             run_vivado(vivado, tcl, root.parent, automation / "vivado_run.log", automation / "stage_logs")
             if args.export_hw:
-                verify_exported_hardware(root, args.name, automation)
+                verify_exported_hardware(root, args.name, automation, require_ps_init=args.bd_mode.startswith("zynq-"))
             summary = write_debug_summary(root, automation, [])
             print(f"Wrote debug summary: {summary}")
         except subprocess.CalledProcessError as exc:
@@ -1802,3 +1823,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

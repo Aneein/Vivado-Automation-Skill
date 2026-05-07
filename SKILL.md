@@ -1,4 +1,4 @@
----
+﻿---
 name: vivado-assistant-automation
 description: "Script-first Vivado/Vitis automation for project migration between Vivado 2020.2 and 2021.1, clean project rebuilds from user sources, BD Tcl export/recreate flows, and Vitis 2021.1 BSP Makefile patching."
 ---
@@ -149,7 +149,7 @@ After initialization:
 
 ## Project Structure & Path Rules
 
-Vivado owns the project workspace. You are just writing scripts that instruct Vivado 鈥?do not create custom directories alongside the project and redirect Vivado outputs into them. Let Vivado manage its own house.
+Vivado owns the project workspace. You are just writing scripts that instruct Vivado 閳?do not create custom directories alongside the project and redirect Vivado outputs into them. Let Vivado manage its own house.
 
 ### Strict Rules
 
@@ -159,7 +159,7 @@ Vivado owns the project workspace. You are just writing scripts that instruct Vi
 
 3. **Reports, checkpoints, bitstreams, and run products stay where Vivado puts them.** Do not copy them into custom root-level folders. Use `<project>.runs/impl_1/*.bit` and the standard Vivado logs/reports for diagnosis.
 
-4. **XDC constraints must be added to the project's `constrs_1` fileset.** Do not leave XDC files as orphans outside the project 鈥?Vivado needs them inside the project to use them during implementation.
+4. **XDC constraints must be added to the project's `constrs_1` fileset.** Do not leave XDC files as orphans outside the project 閳?Vivado needs them inside the project to use them during implementation.
 
 5. **User-owned source files (HDL, XDC, C) may live wherever the user provides them.** Do not create `src/` automatically. Add existing files to the Vivado project via `add_files`.
 
@@ -354,7 +354,7 @@ Default PS-side flow:
 1. Generate the C/C++ file.
 2. Tell the user to place it under `<App_workspace>/<app_name>/src`.
 3. Tell the user to run `Build Application` in Vitis.
-4. Tell the user to run `Run As -> standalone_debug_attach_target_program_and_run`.
+4. Tell the user to launch with PS initialization enabled. In Vitis, use a hardware launch that runs `ps7_init` and `ps7_post_config` before downloading the ELF. Do not use an attach-only launch unless the PS has already been initialized; otherwise ELF download to DDR, commonly `0x100000`, can fail with `APB Memory access port is disabled`.
 
 Do not run Vitis `app build`, Eclipse headless build, or Run As automation by default. Only do so if the user explicitly asks to experiment with Vitis automation and accepts that it may depend on local GUI/JTAG state.
 
@@ -491,4 +491,5 @@ If BD Tcl recreation fails in the target Vivado:
 4. Avoid copying old `.bd` or `.gen` artifacts into the new project as a workaround.
 
 If Vitis Makefile patching finds multiple BSP Makefiles, report all matched paths and patch only when the user asked for workspace-wide repair or provided a specific `--makefile`.
+
 
