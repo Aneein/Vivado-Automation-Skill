@@ -124,6 +124,29 @@ python .\scripts\vivado_assistant.py run-rtl-workflow `
 
 The command lets Vivado create and own the project directory. Generated automation files are outside the Vivado project by default, under `%TEMP%\vivado_assistant\<name>\`: `workflow_manifest.json`, `run_workflow.tcl`, `vivado_run.log`, `last_phase.txt`, `debug_summary.txt`, and `stage_logs\*.log`. Do not ask the user to run Tcl or bat files manually.
 
+The workflow can also be driven from a JSON config whose keys mirror `run-rtl-workflow`:
+
+```powershell
+python .\scripts\vivado_assistant.py run-workflow-config `
+  --config C:\work\my_design\workflow.json `
+  --run
+```
+
+Stage hooks are explicit Tcl files:
+
+```powershell
+python .\scripts\vivado_assistant.py run-rtl-workflow `
+  --name my_design `
+  --root C:\work\my_design `
+  --part xc7z020clg400-1 `
+  --top top `
+  --hook pre_synth:checks\pre_synth.tcl `
+  --hook post_bitstream:checks\post_bitstream.tcl `
+  --run
+```
+
+Supported hook stages: `pre_build`, `post_build`, `pre_synth`, `post_synth`, `pre_impl`, `post_impl`, `pre_bitstream`, `post_bitstream`, `pre_hw_export`, `post_hw_export`.
+
 ### Single-Stage Commands
 
 Register a board XDC original path:
@@ -224,6 +247,46 @@ python .\scripts\vivado_assistant.py program-device `
   --run
 ```
 
+### Artifact, BOOT.BIN, MCS, and Flash Commands
+
+Record standard build outputs without moving Vivado-owned files:
+
+```powershell
+python .\scripts\vivado_assistant.py write-artifact-manifest `
+  --project C:\work\vivado_project\my_fpga_design.xpr `
+  --out C:\work\automation\artifact_manifest.json
+```
+
+Optionally add `--mirror-dir C:\work\release` to copy `.bit`, `.ltx`, `.bin`, `.xsa`, `.elf`, and generated XSDB scripts into a release folder.
+
+Generate a boot image:
+
+```powershell
+python .\scripts\vivado_assistant.py generate-boot-bin `
+  --fsbl C:\work\app\fsbl.elf `
+  --bit C:\work\vivado_project\my_fpga_design.runs\impl_1\my_fpga_design.bit `
+  --out-dir C:\work\automation\boot `
+  --run
+```
+
+Generate flash MCS and program configuration flash:
+
+```powershell
+python .\scripts\vivado_assistant.py generate-mcs `
+  --bit-file C:\work\vivado_project\my_fpga_design.runs\impl_1\my_fpga_design.bit `
+  --output C:\work\automation\my_fpga_design.mcs `
+  --out C:\work\automation `
+  --run
+
+python .\scripts\vivado_assistant.py program-flash `
+  --mcs-file C:\work\automation\my_fpga_design.mcs `
+  --cfgmem-part mt25ql128-spi-x1_x2_x4_x8 `
+  --out C:\work\automation `
+  --run
+```
+
+File scanning now includes nested `.v`, `.sv`, `.vhd`, `.vhdl`, `.vh`, `.svh`, `.xdc`, `.xci`, `.xco`, and `.bd` files. Migration manifests also record `component.xml` IP metadata and BD Tcl files.
+
 For natural-language HDL, testbench, or XDC edits, the agent edits the files directly and then invokes the relevant flow command above.
 
 ## PS/Vitis C Source Rule
@@ -249,6 +312,26 @@ User-side Vitis flow:
 1. Put the generated C/C++ file into `<App_workspace>\<app_name>\src`.
 2. Click `Build Application`.
 3. Launch with PS initialization enabled so Vitis runs `ps7_init` and `ps7_post_config` before downloading the ELF. Avoid attach-only launches unless the PS has already been initialized; otherwise downloads to DDR, commonly `0x100000`, can fail with `APB Memory access port is disabled`.
+4. If the log shows `ps7_init` and `ps7_post_config` did run but `dow ...elf` still fails at `0x100000`, inspect the generated XSDB `loadhw -mem-ranges`. The Vitis range must overlap the XSA/HWH DDR range. For PYNQ-Z2 this is commonly `0x00100000 0x1fffffff`; a generated range such as `0x40000000 0xbfffffff` is wrong for standalone ELF download.
+
+Diagnose the launch log:
+
+```powershell
+python .\scripts\vivado_assistant.py diagnose-vitis-launch `
+  --xsa <hardware.xsa> `
+  --ide-log <IDE.log> `
+  --out <diagnosis.json>
+```
+
+Generate a manual XSDB launch script that uses the correct DDR range:
+
+```powershell
+python .\scripts\vivado_assistant.py generate-xsdb-launch `
+  --xsa <hardware.xsa> `
+  --elf <app.elf> `
+  --out-dir <project>\tools `
+  --mem-range "0x00100000 0x1fffffff"
+```
 
 The only Vitis automation kept by default is the Vivado/Vitis 2021.1 BSP Makefile patch before build.
 

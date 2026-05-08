@@ -28,6 +28,10 @@ This is an execution command. It must include `--run` for normal automation. The
 
 Only use the older commands (`create-project`, `create-bd`, `run-synthesis`, etc.) for manual diagnosis or when the user explicitly asks for a single stage.
 
+Use `run-workflow-config --config <workflow.json> --run` when the project should be repeatable from a saved manifest instead of a long CLI command. The JSON keys mirror `run-rtl-workflow` options, for example `name`, `root`, `part`, `board_part`, `bd_mode`, `ps_uart`, `src_dir`, `xdc_dir`, and `export_hw`.
+
+Stage Tcl hooks are supported but must be explicit. Use `--hook pre_synth:path/to/check.tcl` or `--hooks-config hooks.json`. Supported hook stages are `pre_build`, `post_build`, `pre_synth`, `post_synth`, `pre_impl`, `post_impl`, `pre_bitstream`, `post_bitstream`, `pre_hw_export`, and `post_hw_export`. Hooks run inside the generated Vivado Tcl flow and are logged as VA phases.
+
 Do not stop after generating Tcl, do not generate `run_workflow.bat`, and do not ask the user to execute Tcl/bat manually. Use `--plan-only` only when the user explicitly asks not to run Vivado. If a stage fails, read `debug_summary.txt`, `last_phase.txt`, and the matching `stage_logs/<phase>.log` before editing anything.
 
 ## Design Intent Closure
@@ -165,6 +169,8 @@ Vivado owns the project workspace. You are just writing scripts that instruct Vi
 
 6. **Automation scripts/log summaries live outside the Vivado project directory by default.** `run-rtl-workflow` writes generated Tcl/log/debug files under the system temp directory unless the user explicitly passes `--automation-dir`.
 
+7. **Artifact collection is manifest-first.** Prefer `write-artifact-manifest` to record `.bit`, `.ltx`, `.bin`, `.xsa`, `.hwh`, `.elf`, and generated XSDB scripts. Only use `--mirror-dir` when the user wants a copied release bundle.
+
 ### Correct Layout
 ```text
 <vivado_project_dir>/
@@ -187,9 +193,9 @@ Generated automation files are outside this directory by default:
 - **`M_AXI_GP0_ACLK` must be explicitly connected** to `FCLK_CLK0` after `apply_bd_automation`, otherwise `validate_bd_design` fails.
 - **`proc_sys_reset/dcm_locked` must be driven.** Use `xlconstant` (CONST_VAL=1) to tie it high when FCLK comes directly from PS.
 - **Configure PS properties BEFORE `apply_bd_automation`**, connect `M_AXI_GP0_ACLK` AFTER.
-- **XSA export must be content-verified.** `run-rtl-workflow --export-hw --run` inspects the generated XSA as a zip archive and fails if `.bit` or `.hwh` is missing. For Zynq designs, also inspect that the XSA contains PS initialization files such as `ps7_init.tcl` with `ps7_init` and `ps7_post_config`. If a user re-exports hardware manually and Vitis starts working, treat that as a missing/invalid hardware-export artifact until the XSA inspection proves otherwise.
+- **XSA export must be content-verified.** `run-rtl-workflow --export-hw --run` inspects the generated XSA as a zip archive and fails if `.bit` or `.hwh` is missing. If a user re-exports hardware manually and Vitis starts working, treat that as a missing/invalid hardware-export artifact until the XSA inspection proves otherwise.
 - **Zynq board projects need `board_part` when available.** If Vitis can create a platform but ELF download/run fails with PS debug/APB access errors, compare the `.xpr` against a known-good project and check whether `BoardPart` is empty. Rebuild with `--board-part <vendor>:<board>:part0:<version>` instead of only `--part`.
-- **Handle Vitis APB launch failures as a first-class diagnosis.** If Vitis reports `Memory write error at 0x100000. APB Memory access port is disabled`, do not treat it as a C-code bug. Explain that Vitis attempted to write the ELF to DDR before PS/APB/DDR initialization. Verify the XSA contains `.bit`, `.hwh`, and `ps7_init.tcl`; then tell the user to program FPGA and run `ps7_init; ps7_post_config; rst -processor` before ELF download, or enable the equivalent Vitis launch options: program FPGA, initialize PS, and reset processor/system before launch. If the generated XSA lacks these files or the project lacks `board_part`, rebuild the hardware first.
+- **Vitis APB launch errors can be wrong `loadhw -mem-ranges`, not Makefile or PS init.** When Vitis reports `Memory write error at 0x100000. APB Memory access port is disabled`, inspect the Vitis `IDE.log`/launch log. If it shows `ps7_init command is executed`, `ps7_post_config command is executed`, then `dow ...elf`, check the generated XSDB line `loadhw ... -mem-ranges`. The range must overlap the DDR range in the XSA/HWH, for PYNQ-Z2 commonly `0x00100000 0x1fffffff`; a wrong range such as `0x40000000 0xbfffffff` can make ELF download fail even though PS init ran.
 
 ## Supported Commands
 
@@ -213,6 +219,64 @@ Use these commands for the normal FPGA flow:
 | Convert Vivado versions | `migrate-project` |
 | Patch Vitis BSP Makefile | `patch-vitis-makefile` |
 | Register board XDC | `register-board-xdc` |
+| Diagnose Vitis launch memory range | `diagnose-vitis-launch` |
+| Generate manual XSDB ELF launch | `generate-xsdb-launch` |
+| Run from saved project manifest | `run-workflow-config` |
+| Record bit/ltx/bin/xsa/elf/xsdb artifacts | `write-artifact-manifest` |
+| Generate BOOT.BIN with bootgen | `generate-boot-bin` |
+| Generate flash MCS | `generate-mcs` |
+| Program configuration flash | `program-flash` |
+
+### Config, Hooks, Artifacts, and Flash
+
+For repeatable builds, prefer a JSON workflow config when the command grows long:
+
+```bash
+python scripts/vivado_assistant.py run-workflow-config \
+  --config workflow.json \
+  --run
+```
+
+For stage-specific Tcl customization:
+
+```bash
+python scripts/vivado_assistant.py run-rtl-workflow ... \
+  --hook pre_synth:checks/pre_synth.tcl \
+  --hook post_bitstream:checks/post_bitstream.tcl \
+  --run
+```
+
+For artifact tracking after a build:
+
+```bash
+python scripts/vivado_assistant.py write-artifact-manifest \
+  --project <project.xpr-or-project-dir> \
+  --out <automation_dir>/artifact_manifest.json
+```
+
+For boot/flash flows:
+
+```bash
+python scripts/vivado_assistant.py generate-boot-bin \
+  --fsbl <fsbl.elf> \
+  --bit <design.bit> \
+  --out-dir <automation_dir>/boot \
+  --run
+
+python scripts/vivado_assistant.py generate-mcs \
+  --bit-file <design.bit> \
+  --output <design.mcs> \
+  --out <automation_dir> \
+  --run
+
+python scripts/vivado_assistant.py program-flash \
+  --mcs-file <design.mcs> \
+  --cfgmem-part <vivado_cfgmem_part> \
+  --out <automation_dir> \
+  --run
+```
+
+Source scanning now includes nested `.v`, `.sv`, `.vhd`, `.vhdl`, `.vh`, `.svh`, `.xdc`, `.xci`, `.xco`, `.bd`, and migration manifests also record `component.xml` IP metadata and BD Tcl files. Do not rely on file scanning to infer design intent; still assert required top ports, BD cells, interfaces, addresses, and PS peripherals.
 
 ### Board XDC Handling
 
@@ -362,6 +426,27 @@ Do not run Vitis `app build`, Eclipse headless build, or Run As automation by de
 Exception: the `patch-vitis-makefile` command remains supported and should be used for the Vivado/Vitis 2021.1 BSP Makefile bug before the user builds the app.
 
 If Vitis reports `CDT Project already configured`, `Failed to create application project`, or shows an existing project from `getProjects`, first suspect Vitis workspace metadata/name collision. Use a new empty Vitis workspace or remove/rename the existing application/platform project in Vitis. Do not immediately blame the XSA unless the XSA content inspection shows missing `.bit` or `.hwh`.
+
+If Vitis reports `Memory write error at 0x100000. APB Memory access port is disabled`, do not stop at Makefile or `ps7_init` checks. First read the Vitis `IDE.log` or generated launch script and compare `loadhw -mem-ranges` with the XSA/HWH DDR range:
+
+```bash
+python scripts/vivado_assistant.py diagnose-vitis-launch \
+  --xsa <hardware.xsa> \
+  --ide-log <path-to-IDE.log> \
+  --out <diagnosis.json>
+```
+
+If the Vitis launch range is wrong, generate a manual XSDB launch script that sources `ps7_init.tcl`, runs `ps7_init` and `ps7_post_config`, and downloads the ELF with the correct DDR range:
+
+```bash
+python scripts/vivado_assistant.py generate-xsdb-launch \
+  --xsa <hardware.xsa> \
+  --elf <app.elf> \
+  --out-dir <project>/tools \
+  --mem-range "0x00100000 0x1fffffff"
+```
+
+This writes `run_manual_xsdb.tcl`, `run_manual_xsdb.bat`, an extracted `ps7_init.tcl`, and `xsdb_launch_manifest.json`. Use this when the Vitis GUI generated a wrong `loadhw -mem-ranges`; it is a Vitis launch configuration workaround, not a Vivado bitstream or BSP Makefile fix.
 
 ### 1. Migrate a Vivado Project Across Versions
 
